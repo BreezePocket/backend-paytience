@@ -196,6 +196,8 @@ async fn invalid_transactions_are_400() {
 enum RpcMode {
     Ok(&'static str),
     Error(&'static str),
+    /// HTTP 429 with a JSON-RPC error body, as a throttling node answers.
+    Throttled,
     NotJson,
 }
 
@@ -216,6 +218,13 @@ async fn rpc_handler(State(mock): State<Mock>, body: axum::Json<Value>) -> Respo
             json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32002, "message": msg } }),
         )
         .into_response(),
+        RpcMode::Throttled => (
+            StatusCode::TOO_MANY_REQUESTS,
+            axum::Json(
+                json!({ "jsonrpc": "2.0", "id": id, "error": { "code": 429, "message": "Too many requests for a specific RPC call" } }),
+            ),
+        )
+            .into_response(),
         RpcMode::NotJson => (StatusCode::BAD_GATEWAY, "upstream exploded").into_response(),
     }
 }
@@ -314,6 +323,22 @@ async fn rpc_non_json_returns_unsent_tx() {
     assert_eq!(status, 200);
     assert!(body.get("signature").is_none());
     assert_eq!(calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn rpc_throttling_returns_unsent_tx() {
+    // A 429 is not the node rejecting the transaction: the dashboard broadcasts it.
+    let (url, calls) = mock_rpc(RpcMode::Throttled).await;
+    let (server, _mm) = broadcast_server(&url, None).await;
+    let (tx, _) = tx_case("open_position_sol");
+    let (status, body) = server.sign("web-sign-429", &tx).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body,
+        json!({ "type": "sign_response", "request_id": "web-sign-429", "tx_base64": COSIGNED })
+    );
+    assert_eq!(calls.lock().unwrap().len(), 1);
+    assert_eq!(server.app.stats.snapshot()["sign_rejections"], 0);
 }
 
 #[tokio::test]

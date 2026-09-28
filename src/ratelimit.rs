@@ -1,6 +1,7 @@
 //! Per-client-IP rate limits (contract §2.10): fixed windows per route class. The
 //! client is `CF-Connecting-IP` when it holds an IP (the Cloudflare tunnel sets it),
-//! else the TCP peer. WebSocket upgrades and `OPTIONS` are not limited.
+//! else the TCP peer. WebSocket upgrades have their own class; `OPTIONS` and non-GET
+//! requests to other paths are not limited.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -22,13 +23,15 @@ pub enum RouteClass {
     Sign,
     Faucet,
     Get,
+    /// A WebSocket upgrade attempt on `/ws/rfq` or `/ws/sign`.
+    Ws,
 }
 
 impl RouteClass {
     /// The class of a request, or None when it is not limited.
     pub fn of(method: &Method, path: &str) -> Option<Self> {
         match (method, path) {
-            (_, "/ws/rfq" | "/ws/sign") => None,
+            (_, "/ws/rfq" | "/ws/sign") => Some(Self::Ws),
             (&Method::POST, "/rfq") => Some(Self::Rfq),
             (&Method::POST, "/sign") => Some(Self::Sign),
             (&Method::POST, "/faucet") => Some(Self::Faucet),
@@ -43,21 +46,43 @@ impl RouteClass {
             Self::Sign => limits.sign,
             Self::Faucet => limits.faucet,
             Self::Get => limits.get,
+            Self::Ws => limits.ws,
         }
     }
 }
 
 /// `CF-Connecting-IP` if it parses as an IP, else the peer address, else "unknown".
+/// IPv6 clients are keyed by their /64, the block one subscriber usually holds, so
+/// rotating addresses inside it does not buy a fresh budget.
 pub fn client_key(headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
     let forwarded = headers
         .get("cf-connecting-ip")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.trim().parse::<IpAddr>().ok());
-    match (forwarded, peer) {
-        (Some(ip), _) => ip.to_string(),
-        (None, Some(addr)) => addr.ip().to_string(),
-        (None, None) => "unknown".into(),
+    match forwarded.or(peer.map(|addr| addr.ip())) {
+        Some(ip) => ip_key(ip),
+        None => "unknown".into(),
     }
+}
+
+fn ip_key(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V6(v6) if v6.to_ipv4_mapped().is_none() => {
+            let s = v6.segments();
+            format!("{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3])
+        }
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map_or_else(|| v6.to_string(), |v4| v4.to_string()),
+        IpAddr::V4(v4) => v4.to_string(),
+    }
+}
+
+/// A process on this machine talking to us directly: a loopback peer without
+/// `CF-Connecting-IP`. Public traffic arrives through cloudflared, which also connects
+/// from loopback but always sets that header, so it never looks local.
+pub fn is_local(headers: &HeaderMap, peer: Option<SocketAddr>) -> bool {
+    !headers.contains_key("cf-connecting-ip") && peer.is_some_and(|p| p.ip().is_loopback())
 }
 
 struct Windows {
@@ -135,6 +160,9 @@ impl RateLimiter {
             .extensions()
             .get::<ConnectInfo<SocketAddr>>()
             .map(|c| c.0);
+        if class == RouteClass::Ws && self.limits.exempt_local_ws && is_local(req.headers(), peer) {
+            return true;
+        }
         self.allow(&client_key(req.headers(), peer), class)
     }
 }
@@ -152,6 +180,8 @@ mod tests {
             sign: 2,
             faucet: 1,
             get: 4,
+            ws: 2,
+            exempt_local_ws: false,
         }
     }
 
@@ -165,8 +195,8 @@ mod tests {
         assert_eq!(c(Method::GET, "/board"), Some(RouteClass::Get));
         assert_eq!(c(Method::HEAD, "/health"), Some(RouteClass::Get));
         assert_eq!(c(Method::GET, "/nope"), Some(RouteClass::Get));
-        assert_eq!(c(Method::GET, "/ws/rfq"), None);
-        assert_eq!(c(Method::GET, "/ws/sign"), None);
+        assert_eq!(c(Method::GET, "/ws/rfq"), Some(RouteClass::Ws));
+        assert_eq!(c(Method::GET, "/ws/sign"), Some(RouteClass::Ws));
         assert_eq!(c(Method::OPTIONS, "/rfq"), None);
         assert_eq!(c(Method::POST, "/health"), None);
     }
@@ -212,8 +242,42 @@ mod tests {
         );
         assert_eq!(client_key(&h, Some(peer)), "203.0.113.9");
         h.insert("cf-connecting-ip", HeaderValue::from_static("2001:db8::1"));
-        assert_eq!(client_key(&h, Some(peer)), "2001:db8::1");
+        assert_eq!(client_key(&h, Some(peer)), "2001:db8:0:0::/64");
+        h.insert(
+            "cf-connecting-ip",
+            HeaderValue::from_static("2001:db8:0:0:ffff:1:2:3"),
+        );
+        assert_eq!(
+            client_key(&h, Some(peer)),
+            "2001:db8:0:0::/64",
+            "same /64, same key"
+        );
+        h.insert(
+            "cf-connecting-ip",
+            HeaderValue::from_static("::ffff:198.51.100.7"),
+        );
+        assert_eq!(client_key(&h, Some(peer)), "198.51.100.7");
         h.insert("cf-connecting-ip", HeaderValue::from_static("not-an-ip"));
         assert_eq!(client_key(&h, Some(peer)), "10.0.0.1");
+    }
+
+    #[test]
+    fn local_means_loopback_without_the_tunnel_header() {
+        let lo: SocketAddr = "127.0.0.1:5555".parse().unwrap();
+        let lo6: SocketAddr = "[::1]:5555".parse().unwrap();
+        let remote: SocketAddr = "10.0.0.1:5555".parse().unwrap();
+        let mut h = HeaderMap::new();
+        assert!(is_local(&h, Some(lo)));
+        assert!(is_local(&h, Some(lo6)));
+        assert!(!is_local(&h, Some(remote)));
+        assert!(!is_local(&h, None));
+        // cloudflared connects from loopback but always forwards the client's address.
+        h.insert("cf-connecting-ip", HeaderValue::from_static("203.0.113.9"));
+        assert!(!is_local(&h, Some(lo)));
+        h.insert("cf-connecting-ip", HeaderValue::from_static("garbage"));
+        assert!(
+            !is_local(&h, Some(lo)),
+            "any tunnel header, even a bad one, is not local"
+        );
     }
 }

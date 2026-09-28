@@ -8,6 +8,7 @@ use anyhow::Context;
 use crate::config::Config;
 use crate::faucet::{Faucet, load_keypair};
 use crate::market::Coalescer;
+use crate::preauth::PreauthGate;
 use crate::ratelimit::RateLimiter;
 use crate::registry::Registry;
 use crate::solana_rpc::SolanaRpc;
@@ -24,6 +25,8 @@ pub struct App {
     /// Present only when `FAUCET_KEYPAIR` is set.
     pub faucet: Option<Faucet>,
     pub rate_limiter: RateLimiter,
+    /// Slots for WebSocket connections that have not authenticated yet (§1.2).
+    pub preauth: PreauthGate,
 }
 
 impl App {
@@ -55,6 +58,10 @@ impl App {
             expiries_cache: Coalescer::new(config.expiries_cache_ttl),
             faucet,
             rate_limiter: RateLimiter::new(config.rate_limits),
+            preauth: PreauthGate::new(
+                config.ws_max_unauthenticated,
+                config.ws_max_unauthenticated_per_ip,
+            ),
             config,
         }))
     }

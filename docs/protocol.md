@@ -78,7 +78,9 @@ The channel name used in auth is the path without the leading slash: `ws/rfq` or
    **4001** (bad hello / signature / version / channel), **4003** (not allowlisted), or
    **4009** (program or mint mismatch).
 4. A connection that has not sent a valid `hello` within **10 s** is closed (4001).
-   Frames other than `hello` before authentication are ignored.
+   Frames other than `hello` before authentication are ignored, except that a text or
+   binary frame larger than **16 KiB** is refused without being parsed: `error`
+   "hello too large", close **4001**.
 
 Connection identity is `(mm_pubkey, instance_id, channel)`. A new authenticated
 connection with the same identity replaces the old one (the old socket is closed with
@@ -87,10 +89,31 @@ code **4000** "replaced"). Different `instance_id`s of one pubkey coexist.
 An **instance is eligible for RFQs** only while both its `ws/rfq` and `ws/sign`
 connections are authenticated.
 
+Connection limits (both channels):
+- Every message (and frame) is capped at **1 MiB**, before and after authentication.
+  The largest legitimate one is a `board` `market_response`: about 16 KB for SOL
+  (4 cells × ≤ 15 expiries) and under 100 KB even for an asset with daily expiries out
+  to 90 days, so the cap leaves ≥ 10× headroom. A larger message closes the
+  connection; after authentication that is a disconnect (§1.3).
+- At most **256** sockets may be upgraded but not yet authenticated at once, and at
+  most **8** per client IP (the client as §2.10 identifies it). Past either cap the
+  upgrade is answered **503** `{error}` without upgrading. A socket stops counting as
+  soon as its `hello` is verified (or rejected), or it closes (including the 10 s
+  timeout).
+- Upgrade attempts are rate limited per client IP (§2.10): **429** `{error}`.
+- A desk on the backend's own machine (a loopback peer that sends no
+  `CF-Connecting-IP`) is exempt from both the caps above and the upgrade rate limit, so
+  a flood through the public tunnel can never keep the house desk from reconnecting.
+  cloudflared also connects from loopback but always sets that header, so public
+  traffic never qualifies.
+
 ### 1.3 Liveness
 
 - The backend sends a WebSocket ping every **20 s** on every connection and closes any
-  connection that has sent no frame (including pong) for **60 s**.
+  connection that has sent no frame (including pong) for **60 s**, with code
+  **4008** "idle timeout".
+- On shutdown the backend closes every MM connection with **1001** "server shutting
+  down".
 - The desk also pings every 20 s (existing behaviour); both sides answer pings.
 - On close, every request pending on that connection fails immediately
   ("market maker disconnected").
@@ -171,7 +194,22 @@ bodies are limited to 64 KiB. Errors that are not typed messages are
 `{ "error": "<message>" }`.
 
 The backend is **online** while at least one eligible MM instance (§1.2) exists.
-"Fresh" MM data means a `health` snapshot received within the last 30 s.
+"Fresh" MM data means a `health` snapshot received within the last 30 s (the backend
+polls `health` on every `ws/rfq` connection every `HEALTH_POLL_MS`, first right after
+it authenticates).
+
+**Live over dry-run.** An eligible instance is **dry-run** when its fresh `health`
+reports `dry_run: true`: it quotes but refuses to co-sign. Every other eligible
+instance is **live**, including one without a fresh snapshot yet (just connected).
+Wherever the backend picks MMs below (the auction's asked set, market data), it uses
+the live ones if there are any, else the dry-run ones, so a dry-run-only setup still
+works.
+
+**Market data** (§2.1-§2.5) uses one **representative instance per MM pubkey**, so an
+MM running two desks counts once: among that pubkey's instances in the chosen
+(live, else dry-run) set, the one with the freshest `health` snapshot, else the most
+recently connected. For `/health` and `/assets` the set is chosen among instances with
+a fresh snapshot: the live ones if any MM with a fresh snapshot is live.
 
 ### 2.1 `GET /health`
 
@@ -197,11 +235,14 @@ Same shape as the desk's `/health`, aggregated, plus backend fields:
 }
 ```
 
-Aggregation over **fresh, eligible** MMs:
+Aggregation over the **fresh, eligible** representatives (§2: live ones if any is
+fresh, else dry-run ones; one snapshot per pubkey):
 - `ok`: at least one such MM whose own `health.ok` is true.
-- `mm_count`: number of distinct eligible MM pubkeys.
-- `mm_pubkey`: kept for older dashboards (their `resolveDesk` requires a string).
-- `dry_run`: true only when every such MM reports `dry_run: true` (nothing can co-sign).
+- `mm_count`: number of distinct MM pubkeys merged.
+- `mm_pubkey`: kept for older dashboards (their `resolveDesk` requires a string): the
+  first merged MM, else any online MM, else `""`.
+- `dry_run`: true only when every fresh eligible MM reports `dry_run: true` (nothing
+  can co-sign); those are then the MMs merged.
 - `price`: `spot` = median of the MMs' `price.spot`; `spotAgeMs` = min; `vol` = median;
   `expiries` = max; `source` = `"aggregate"`.
 - `exposure`: `totalUsd`, `capTotalUsd`, `capPerExpiryUsd` are sums;
@@ -209,12 +250,16 @@ Aggregation over **fresh, eligible** MMs:
 - When no MM is fresh: `ok: false`, `mm_count: 0`, `price: { "source": "aggregate", "spot": null, … }`,
   `assets: []`, `exposure` all zero with `perExpiry: {}`.
 
+The status is always **200**, online or not; `ok` carries the verdict.
+
 MM identities beyond `mm_pubkey` are **not** listed publicly (spec: don't expose MM
 identity); see `GET /admin/mms`.
 
 ### 2.2 `GET /assets`
 
-`{ "assets": [...] }`, merged across fresh eligible MMs by case-insensitive `asset`:
+`{ "assets": [...] }` (always **200**), built from the same `health` snapshots as
+`/health` (their `assets` field; no `market_request` is sent), merged across the same
+MMs by case-insensitive `asset`:
 
 | field | rule |
 |---|---|
@@ -231,13 +276,15 @@ Order: SOL first, then first-seen order.
 
 ### 2.3 `GET /price?asset=SOL`
 
-Forwarded as `market_request{method:"price"}` to one fresh eligible MM (the one with the
-freshest snapshot) and returned verbatim. 503 `{error}` when no MM is online.
+Forwarded as `market_request{method:"price"}` to one representative (§2): the one with
+the freshest snapshot, else (right after a connect) the most recently connected; the
+result is returned verbatim. 503 `{error}` when no MM is online.
 
 ### 2.4 `GET /expiries?asset=SOL`
 
-`{ "expiries": [...] }`: `market_request{method:"expiries"}` to every eligible MM
-(timeout 2.5 s each), merged by `expiry_ts`:
+`{ "expiries": [...] }`: `market_request{method:"expiries"}` to every representative
+(§2: one instance per MM pubkey, live preferred; timeout 2.5 s each), merged by
+`expiry_ts`:
 `days` from the first; `forward_price` median; `atm_vol` median of non-null (else null);
 `strikes` sorted ascending union (dedup exact values). Sorted by `expiry_ts`.
 Cached 30 s per asset (case-insensitive key), with request coalescing.
@@ -249,7 +296,7 @@ as "market maker did not respond in time"), and the status every MM error shared
 ### 2.5 `GET /board?asset=&product=&amount=&moneyness=&max_days=&exact=`
 
 Same query parameters as the desk. The backend fans out `market_request{method:"board"}`
-(timeout 2.5 s each) and merges:
+to the same representatives as §2.4 (timeout 2.5 s each) and merges:
 - Top level from the first successful board: `asset`, `underlying`, `venue`,
   `tradable` (OR across boards), `mint`, `decimals`, `product`, `token`, `yield_token`,
   `amount`. `index_price` = median. `generated_at` = max. `fee_pct` = min across
@@ -279,16 +326,20 @@ Backend validation (else **400** `{ "type": "rfq_decline", "rfq_id": "…", "rea
 optional (generated if missing). Asset/expiry rules are the MMs' job.
 
 Auction:
-1. Asked set = every eligible MM instance (§1.2). None → **503**
-   `rfq_decline` "no market maker is online".
+1. Asked set = every **live** eligible MM instance (§1.2, §2); if none is live,
+   every dry-run one (a dry-run MM would win quotes it then refuses to co-sign). None
+   → **503** `rfq_decline` "no market maker is online".
 2. Send `rfq_request` (backend `rfq_id`) to each; collect until all have answered or
    `RFQ_TIMEOUT_MS` (default 1000) elapses.
 3. Winner = largest `yield_amount` among valid responses; ties → earliest received.
 4. Response **200**: the winner's `rfq_response` with `rfq_id` replaced by the client's,
-   plus `mm_name` (allowlist name), `quotes_received` (valid quotes), `mms_asked`.
+   plus `mm_name` (allowlist name), `quotes_received` (valid quotes), `mms_asked`
+   (size of the asked set).
 5. No quotes but ≥1 decline → **200** `rfq_decline` with `reason`: the single distinct
    reason, or `"no market maker quoted: <r1>; <r2>"` (distinct, in arrival order).
-6. No answers at all → **504** `rfq_decline` "no market maker responded in time".
+6. No valid quote and no decline → **504** `rfq_decline` "no market maker responded
+   in time". This includes MMs that timed out or disconnected, and answers that were
+   discarded as invalid or spoofed (§1.4).
 
 The backend remembers the winner by `nonce` for 10 minutes:
 `nonce → { mm_pubkey, instance_id, quote_id, valid_until }`.
@@ -310,16 +361,21 @@ Request: `{ "type": "sign_request", "request_id": "web-sign-…", "tx_base64": "
    `sign_rejection` "market maker <first 8 chars> is not connected".
 3. Forward `sign_request` (backend `request_id`); wait `SIGN_TIMEOUT_MS` (default
    10000). Timeout → **504** `sign_rejection` "market maker did not respond in time".
+   A connection that was already gone before sending is skipped for the next
+   candidate; one that closes after the request was sent → **504** `sign_rejection`
+   "market maker disconnected" (not retried: the MM may have co-signed).
 4. `sign_rejection` from the MM → **422**, reason passed through.
 5. `sign_response` from the MM:
    - If it already has `signature`, return it (**200**).
    - Else if `BROADCAST` (default true): `sendTransaction` (base64, preflight on,
      `preflightCommitment: confirmed`) on `SOLANA_RPC`.
      - Success → **200** with `signature` set.
-     - JSON-RPC error response (e.g. simulation failed) → **422** `sign_rejection`
-       "broadcast failed: <rpc message>".
-     - Transport failure / timeout / non-JSON → **200** without `signature` (the
-       dashboard then broadcasts itself, as it does today).
+     - JSON-RPC error response with a 2xx HTTP status (e.g. simulation failed) →
+       **422** `sign_rejection` "broadcast failed: <rpc message>".
+     - HTTP **429** or **5xx** (whatever the body, since a throttled or failing node
+       has not judged the transaction), transport failure / timeout, or a non-JSON
+       body → **200** without `signature` (the dashboard then broadcasts itself, as it
+       does today).
    - Else **200** without `signature`.
    All typed responses echo the **client's** `request_id`.
 
@@ -337,15 +393,24 @@ Enabled only when `FAUCET_KEYPAIR` is set (else both return **404** `{error:"fau
   "<asset> has no price yet; try again shortly"). Amount = `FAUCET_ASSET_USD / spot`
   rounded to 4 significant figures; base units = round(amount × 10^decimals).
 - Cooldown per `(wallet, SYMBOL)` of `FAUCET_COOLDOWN_MS` → **429**
-  "faucet cooldown: try again in N min". The slot is taken before sending and released
-  if the mint fails.
+  "faucet cooldown: try again in N min". The slot is taken before sending.
 - Transaction (fee payer and signer: the faucet authority): SPL ATA program
   `CreateIdempotent` (data `[1]`; accounts payer(s,w), ata(w), owner, mint,
   system program, token program) then SPL Token `MintTo` (data `[7] + u64 LE`;
   accounts mint(w), ata(w), authority(s)). Legacy token program
   `TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA`, ATA program
   `ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL`. Sent with `sendTransaction`, then
-  polled with `getSignatureStatuses` until `confirmed` (≤ 30 s). RPC failure → **502**.
+  polled with `getSignatureStatuses` until `confirmed` (≤ 30 s).
+- The mint **definitely failed** (an error before sending, such as the blockhash
+  fetch; a JSON-RPC error from `sendTransaction`; or a non-null `err` from
+  `getSignatureStatuses`) → **502** `{error:"faucet mint failed: <why>"}` and the
+  cooldown slot is released. `<why>` is the node's own message; "rpc busy; try again
+  shortly" when the RPC answered HTTP 429 (a rate limiter refused the request, so the
+  node never saw it); or "rpc unavailable" for a transport failure, HTTP 5xx or
+  unparseable reply before sending (details are only logged).
+- The **outcome is unknown** (`sendTransaction` hit a transport failure, HTTP 5xx or
+  an unparseable reply, or the transaction was not `confirmed` within 30 s) → **502** `{ "error": "faucet mint outcome unknown; try again after the cooldown", "signature": "<the mint's signature>" }`
+  and the cooldown slot is **kept**, since the mint may still land.
 - Then best-effort `requestAirdrop(owner, FAUCET_SOL_AIRDROP × 10^9)`; failure is not
   an error.
 - **200** `{ "pubkey", "asset": "USDC"|"<SYMBOL>", "amount", "usdc_amount", "signature", "usdc_signature", "sol_airdrop_signature": "…"|null }`
@@ -362,9 +427,13 @@ counters `rfqs_asked`, `quotes`, `declines`, `timeouts`, `wins`, `signs`,
 
 ### 2.10 Rate limits
 
-Per client IP (`CF-Connecting-IP` header if present, else the peer address), fixed
-one-minute windows: `POST /rfq` 120, `POST /sign` 30, `POST /faucet` 10, all `GET`s
-600. Over the limit → **429** `{error:"rate limited"}`.
+Per client IP (`CF-Connecting-IP` header if it parses as an IP, else the peer
+address; IPv6 clients are grouped by their /64, IPv4-mapped IPv6 counts as IPv4), fixed one-minute windows: `POST /rfq` 120, `POST /sign` 30, `POST /faucet`
+10, all `GET`s 600 (any path, unknown ones included), and WebSocket upgrade attempts
+on `/ws/rfq` and `/ws/sign` 60 (their own budget, not counted as `GET`s). `OPTIONS`
+and `POST`s to other paths are not limited. Over the limit → **429**
+`{error:"rate limited"}`: a plain error body on every route, `/rfq` and `/sign`
+included (not a typed `rfq_decline` / `sign_rejection`), with the CORS headers.
 
 ---
 
@@ -373,7 +442,7 @@ one-minute windows: `POST /rfq` 120, `POST /sign` 30, `POST /faucet` 10, all `GE
 | var | default | meaning |
 |---|---|---|
 | `BIND_ADDR` | `127.0.0.1:8080` | HTTP + WS listen address |
-| `SOLANA_RPC` | `https://api.devnet.solana.com` | JSON-RPC for broadcast + faucet |
+| `SOLANA_RPC` | `https://api.devnet.solana.com` | JSON-RPC for broadcast + faucet; may carry an API key in its path or query, so only its host is ever logged and no response or log line contains the rest |
 | `PROGRAM_ID` | `BeytdpJYSGP1oFRxEiBLkSRGuW6HW3Pk9dqSZCuSteQ9` | breezepocket program |
 | `USDC_MINT` | **required** | USDC mint in the program's GlobalConfig |
 | `MM_ALLOWLIST` | **required** | `name:pubkey,name:pubkey` (name optional: `pubkey` alone uses its first 8 chars) |
@@ -391,6 +460,14 @@ one-minute windows: `POST /rfq` 120, `POST /sign` 30, `POST /faucet` 10, all `GE
 | `FAUCET_COOLDOWN_MS` | 3600000 | |
 | `ADMIN_TOKEN` | empty (off) | enables `GET /admin/mms` |
 | `RUST_LOG` | `info` | tracing filter |
+
+A malformed `.env` fails startup (a missing one is fine).
+
+Fixed limits, not read from the environment (fields of `Config` so tests can shrink
+them): hello timeout 10 s, ping 20 s, idle 60 s, health freshness 30 s (§1.2, §1.3,
+§2); RPC request timeout 10 s; faucet confirmation 30 s polled every 500 ms (§2.8);
+rate limits (§2.10); WebSocket message cap 1 MiB, unauthenticated-socket caps
+256 total / 8 per IP and the local-desk exemption (§1.2). The 16 KiB pre-authentication frame limit is a constant.
 
 ## 4. Desk configuration (MM-system-breezepocket)
 

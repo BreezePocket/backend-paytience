@@ -45,7 +45,7 @@ pub fn build_router(app: Arc<App>) -> Router {
         .with_state(app)
 }
 
-/// §2.10: per-IP fixed-window limits; WebSocket upgrades and OPTIONS pass.
+/// §2.10: per-IP fixed-window limits (WebSocket upgrades included); OPTIONS passes.
 async fn rate_limit(State(app): State<Arc<App>>, req: Request, next: Next) -> Response {
     if app.rate_limiter.check(&req) {
         next.run(req).await
@@ -115,7 +115,12 @@ async fn health(State(app): State<Arc<App>>) -> Response {
     let mm_pubkey = snaps
         .first()
         .map(|(pk, _)| pk.clone())
-        .or_else(|| app.registry.eligible().first().map(|i| i.mm_pubkey.clone()))
+        .or_else(|| {
+            app.registry
+                .market_representatives(app.config.health_fresh)
+                .first()
+                .map(|i| i.mm_pubkey.clone())
+        })
         .unwrap_or_default();
     json_response(
         200,
@@ -220,7 +225,13 @@ async fn faucet_claim(
     };
     match faucet.claim(&app, &body).await {
         Ok(v) => json_response(200, &v),
-        Err(e) => json_response(e.status, &error_body(e.message)),
+        Err(e) => {
+            let mut body = error_body(e.message);
+            if let (Some(sig), Some(obj)) = (e.signature, body.as_object_mut()) {
+                obj.insert("signature".into(), json!(sig));
+            }
+            json_response(e.status, &body)
+        }
     }
 }
 

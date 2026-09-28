@@ -279,7 +279,7 @@ async fn failed_send_releases_the_cooldown() {
 }
 
 #[tokio::test]
-async fn failed_or_unconfirmed_transactions_are_502() {
+async fn transactions_failed_on_chain_are_502_and_release_the_cooldown() {
     let rpc = scripted_rpc(|method, params, seen| match method {
         "getSignatureStatuses" => RpcReply::Result(json!({ "context": { "slot": 5 }, "value": [
             { "slot": 5, "confirmations": 0, "err": { "InstructionError": [1, { "Custom": 5 }] }, "confirmationStatus": "confirmed" }
@@ -295,7 +295,41 @@ async fn failed_or_unconfirmed_transactions_are_502() {
         msg.starts_with(&format!("faucet mint failed: transaction {SIG} failed: ")),
         "{msg}"
     );
+    assert!(body.get("signature").is_none());
+    // A definite failure frees the slot: the next attempt reaches the cluster again.
+    claim(&server, json!({ "pubkey": user_pubkey() })).await;
+    assert_eq!(rpc.calls_to("sendTransaction").len(), 2);
+}
 
+/// Mint outcome unknown: a 502 that keeps the cooldown, so a retry cannot double-mint.
+/// `signature` defaults to the signature of the transaction that was sent.
+async fn assert_outcome_unknown(rpc: &MockRpc, server: &TestServer, signature: Option<&str>) {
+    let body = json!({ "pubkey": user_pubkey() });
+    let (status, err) = claim(server, body.clone()).await;
+    let tx = sent_tx(rpc, 0);
+    assert_signed_by_authority(&tx);
+    let signature = signature.map_or_else(|| tx.signatures[0].to_string(), str::to_string);
+    assert_eq!(
+        (status, err),
+        (
+            502,
+            json!({ "error": "faucet mint outcome unknown; try again after the cooldown", "signature": signature })
+        )
+    );
+    assert!(rpc.calls_to("requestAirdrop").is_empty());
+    let (status, err) = claim(server, body).await;
+    assert_eq!(
+        (status, err),
+        (
+            429,
+            json!({ "error": "faucet cooldown: try again in 60 min" })
+        )
+    );
+    assert_eq!(rpc.calls_to("sendTransaction").len(), 1);
+}
+
+#[tokio::test]
+async fn unconfirmed_mint_keeps_the_cooldown() {
     let rpc = scripted_rpc(|method, params, seen| match method {
         "getSignatureStatuses" => {
             RpcReply::Result(json!({ "context": { "slot": 5 }, "value": [null] }))
@@ -308,18 +342,87 @@ async fn failed_or_unconfirmed_transactions_are_502() {
     let keyfile = cfg.faucet_keypair.clone().unwrap();
     let server = start(cfg).await;
     std::fs::remove_file(keyfile).unwrap();
-    let (status, body) = claim(&server, json!({ "pubkey": user_pubkey() })).await;
-    assert_eq!(status, 502);
-    assert!(
-        body["error"]
-            .as_str()
-            .unwrap()
-            .ends_with("not confirmed within 0.2 s"),
-        "{body}"
+    assert_outcome_unknown(&rpc, &server, Some(SIG)).await;
+}
+
+#[tokio::test]
+async fn throttled_send_releases_the_cooldown() {
+    // HTTP 429 means a rate limiter refused the request before the node saw it, so the
+    // mint did not happen and the wallet may retry at once.
+    let rpc = scripted_rpc(|method, params, seen| match method {
+        "sendTransaction" if seen == 0 => RpcReply::Status(429, "Too many requests".into()),
+        _ => happy(method, params, seen),
+    })
+    .await;
+    let server = faucet_server(&rpc).await;
+    let body = json!({ "pubkey": user_pubkey() });
+    let (status, err) = claim(&server, body.clone()).await;
+    assert_eq!(
+        (status, err),
+        (
+            502,
+            json!({ "error": "faucet mint failed: rpc busy; try again shortly" })
+        )
     );
-    // The slot was released: the next attempt reaches the cluster again.
-    claim(&server, json!({ "pubkey": user_pubkey() })).await;
-    assert_eq!(rpc.calls_to("sendTransaction").len(), 2);
+    let (status, ok) = claim(&server, body).await;
+    assert_eq!(status, 200, "{ok}");
+    assert_eq!(ok["signature"], SIG);
+}
+
+#[tokio::test]
+async fn failing_send_keeps_the_cooldown() {
+    // HTTP 5xx is a transport failure even with a JSON-RPC error body: the node may
+    // have taken the transaction, so the faucet reports its own signature.
+    for status in [500, 503] {
+        let rpc = scripted_rpc(move |method, params, seen| match method {
+            "sendTransaction" => RpcReply::Status(status, "Too many requests".into()),
+            _ => happy(method, params, seen),
+        })
+        .await;
+        let server = faucet_server(&rpc).await;
+        assert_outcome_unknown(&rpc, &server, None).await;
+    }
+}
+
+#[tokio::test]
+async fn rpc_transport_errors_never_reveal_the_rpc_url() {
+    // Bind then drop: nothing listens on this port any more.
+    let dead = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let rpc = scripted_rpc(happy).await;
+    let mut cfg = faucet_config(&rpc);
+    cfg.solana_rpc = format!("http://{dead}/v2/SECRETPATHKEY?api-key=SECRETQUERYKEY");
+    let keyfile = cfg.faucet_keypair.clone().unwrap();
+    let server = start(cfg).await;
+    std::fs::remove_file(keyfile).unwrap();
+    let r = server
+        .http
+        .post(server.url("/faucet"))
+        .json(&json!({ "pubkey": user_pubkey() }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 502);
+    let text = r.text().await.unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&text).unwrap(),
+        json!({ "error": "faucet mint failed: rpc unavailable" })
+    );
+    for secret in [
+        "SECRETPATHKEY",
+        "SECRETQUERYKEY",
+        "/v2",
+        "api-key",
+        "for url",
+    ] {
+        assert!(!text.contains(secret), "{secret} leaked: {text}");
+    }
+    // Nothing was sent, so the slot was released.
+    let (status, _) = claim(&server, json!({ "pubkey": user_pubkey() })).await;
+    assert_eq!(status, 502);
 }
 
 #[tokio::test]

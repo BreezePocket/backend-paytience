@@ -10,6 +10,7 @@ pub mod conn;
 pub mod faucet;
 pub mod http;
 pub mod market;
+pub mod preauth;
 pub mod protocol;
 pub mod ratelimit;
 pub mod registry;

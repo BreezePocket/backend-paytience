@@ -1,6 +1,7 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use anyhow::Context;
+use paytience_backend::solana_rpc::host_of;
 use paytience_backend::{App, Config, serve};
 use tracing_subscriber::EnvFilter;
 
@@ -26,6 +27,8 @@ async fn main() -> anyhow::Result<()> {
         program_id = %config.program_id,
         usdc_mint = %config.usdc_mint,
         mms = config.allowlist.entries().len(),
+        // Host only: the path or query of SOLANA_RPC may hold an API key.
+        rpc_host = host_of(&config.solana_rpc),
         broadcast = config.broadcast,
         "starting paytience-backend"
     );

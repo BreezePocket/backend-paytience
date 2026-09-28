@@ -431,3 +431,101 @@ async fn health_is_polled_on_the_configured_interval() {
         json!({})
     );
 }
+
+/// A board MM whose health says `dry_run` as given.
+async fn board_mm_with_health(
+    server: &TestServer,
+    key: &MmKey,
+    health: Value,
+    board: Value,
+) -> FakeMm {
+    FakeMm::builder(key, "i1")
+        .health(health)
+        .on_rfq(move |req| {
+            if req["type"] == "market_request" && req["method"] == "board" {
+                Action::Reply(market_ok(req, board.clone()))
+            } else {
+                Action::Ignore
+            }
+        })
+        .connect(server)
+        .await
+}
+
+#[tokio::test]
+async fn market_data_prefers_live_mms_over_dry_run_ones() {
+    let server = start(test_config()).await;
+    let (a, b) = (key_a(), key_b());
+    let _live = board_mm_with_health(
+        &server,
+        &a,
+        desk_health(&a, 200.0, 100.0),
+        board_body(200.0, 0.5, json!([cell(210.0, "1000", 10.0)])),
+    )
+    .await;
+    // The dry-run MM prices higher everywhere; none of it is shown.
+    let dry = board_mm_with_health(
+        &server,
+        &b,
+        dry_run_health(&b, 300.0),
+        board_body(
+            300.0,
+            0.0,
+            json!([cell(210.0, "9000", 90.0), cell(220.0, "9", 1.0)]),
+        ),
+    )
+    .await;
+    server.wait_eligible(2).await;
+    server.wait_health(2).await;
+
+    let (status, board) = server.get("/board").await;
+    assert_eq!(status, 200, "{board}");
+    assert_eq!(board["mm_count"], 1);
+    assert_eq!(board["index_price"], 200);
+    let quotes = board["expiries"][0]["quotes"].as_array().unwrap();
+    assert_eq!(quotes.len(), 1);
+    assert_eq!(quotes[0]["mm_pubkey"], a.pubkey);
+    assert_eq!(quotes[0]["yield_amount"], "1000");
+    assert!(
+        dry.received(Channel::Rfq, "market_request", Some("board"))
+            .is_empty()
+    );
+
+    let (status, h) = server.get("/health").await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        (h["mm_count"].clone(), h["dry_run"].clone()),
+        (json!(1), json!(false))
+    );
+    assert_eq!(h["mm_pubkey"], a.pubkey);
+    assert_eq!(h["price"]["spot"], 200);
+    let (_, assets) = server.get("/assets").await;
+    assert_eq!(assets["assets"][0]["mm_count"], 1);
+    assert_eq!(assets["assets"][0]["spot"], 200);
+}
+
+#[tokio::test]
+async fn dry_run_only_mms_still_serve_market_data() {
+    let server = start(test_config()).await;
+    let b = key_b();
+    let _dry = board_mm_with_health(
+        &server,
+        &b,
+        dry_run_health(&b, 300.0),
+        board_body(300.0, 0.0, json!([cell(310.0, "9000", 90.0)])),
+    )
+    .await;
+    server.wait_eligible(1).await;
+    server.wait_health(1).await;
+
+    let (status, board) = server.get("/board").await;
+    assert_eq!(status, 200, "{board}");
+    assert_eq!(board["mm_count"], 1);
+    assert_eq!(board["expiries"][0]["quotes"][0]["mm_pubkey"], b.pubkey);
+    let (_, h) = server.get("/health").await;
+    assert_eq!(
+        (h["mm_count"].clone(), h["dry_run"].clone()),
+        (json!(1), json!(true))
+    );
+    assert_eq!(h["price"]["spot"], 300);
+}

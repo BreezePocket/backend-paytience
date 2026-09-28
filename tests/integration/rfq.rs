@@ -235,3 +235,55 @@ async fn disconnect_fails_the_auction_fast() {
         started.elapsed()
     );
 }
+
+#[tokio::test]
+async fn live_mms_are_asked_and_dry_run_ones_are_not() {
+    let server = start(test_config()).await;
+    let (a, b) = (key_a(), key_b());
+    let ka = a.clone();
+    let _live = FakeMm::builder(&a, "a1")
+        .on_rfq(move |req| Action::Reply(quote(req, &ka, "1000", "qa")))
+        .connect(&server)
+        .await;
+    let kb = b.clone();
+    let dry = FakeMm::builder(&b, "b1")
+        .health(dry_run_health(&b, 200.0))
+        .on_rfq(move |req| Action::Reply(quote(req, &kb, "9000", "qb")))
+        .connect(&server)
+        .await;
+    server.wait_eligible(2).await;
+    server.wait_health(2).await;
+
+    let (status, body) = server.rfq("web-live", "7").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["mm_pubkey"], a.pubkey,
+        "the dry-run MM would never co-sign"
+    );
+    assert_eq!(body["yield_amount"], "1000");
+    assert_eq!(
+        (body["mms_asked"].clone(), body["quotes_received"].clone()),
+        (json!(1), json!(1))
+    );
+    assert!(dry.received(Channel::Rfq, "rfq_request", None).is_empty());
+    assert_eq!(server.app.registry.counters(&b.pubkey).rfqs_asked, 0);
+}
+
+#[tokio::test]
+async fn dry_run_mms_are_asked_when_no_live_mm_is_online() {
+    let server = start(test_config()).await;
+    let b = key_b();
+    let kb = b.clone();
+    let _dry = FakeMm::builder(&b, "b1")
+        .health(dry_run_health(&b, 200.0))
+        .on_rfq(move |req| Action::Reply(quote(req, &kb, "900", "qb")))
+        .connect(&server)
+        .await;
+    server.wait_eligible(1).await;
+    server.wait_health(1).await;
+
+    let (status, body) = server.rfq("web-dry", "8").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["mm_pubkey"], b.pubkey);
+    assert_eq!(body["mms_asked"], 1);
+}

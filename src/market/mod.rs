@@ -14,7 +14,7 @@ use tokio::sync::OnceCell;
 
 use crate::conn::Conn;
 use crate::protocol::{new_id, num};
-use crate::registry::EligibleInstance;
+use crate::registry::{EligibleInstance, prefer_live, representatives};
 use crate::state::App;
 use merge::MmFailure;
 
@@ -347,8 +347,8 @@ fn asset_params(asset: Option<&str>) -> Value {
 
 /// `/price` (§2.3): one MM, the one with the freshest snapshot, returned verbatim.
 pub async fn price(app: &App, asset: Option<&str>) -> MarketResult {
-    let reps = app.registry.market_representatives();
     let fresh = app.config.health_fresh;
+    let reps = app.registry.market_representatives(fresh);
     let target = reps
         .iter()
         .filter_map(|r| r.fresh_health(fresh).map(|h| (r, h.at)))
@@ -376,7 +376,7 @@ pub async fn expiries(app: &App, asset: Option<&str>) -> MarketResult {
     let params = asset_params(asset);
     app.expiries_cache
         .get(&key, || async move {
-            let targets = app.registry.market_representatives();
+            let targets = app.registry.market_representatives(app.config.health_fresh);
             if targets.is_empty() {
                 return Err(MarketError::new(503, NO_MM_ONLINE));
             }
@@ -400,7 +400,7 @@ pub async fn board(app: &App, query: &BoardQuery) -> MarketResult {
     let params = query.params();
     app.board_cache
         .get(&query.cache_key(), || async move {
-            let targets = app.registry.market_representatives();
+            let targets = app.registry.market_representatives(app.config.health_fresh);
             if targets.is_empty() {
                 return Err(MarketError::new(503, NO_MM_ONLINE));
             }
@@ -445,11 +445,17 @@ fn split_results<T>(
     (ok, failures)
 }
 
-/// Fresh health snapshots, one per MM pubkey (§2.1 "fresh, eligible").
+/// Fresh health snapshots, one per MM pubkey (§2.1 "fresh, eligible"): the live MMs'
+/// if any is fresh, else the dry-run ones'.
 pub fn fresh_snapshots(app: &App) -> Vec<(String, Value)> {
     let fresh = app.config.health_fresh;
-    app.registry
-        .market_representatives()
+    let with_fresh: Vec<EligibleInstance> = app
+        .registry
+        .eligible()
+        .into_iter()
+        .filter(|i| i.fresh_health(fresh).is_some())
+        .collect();
+    representatives(prefer_live(with_fresh, fresh))
         .into_iter()
         .filter_map(|r| {
             r.fresh_health(fresh)

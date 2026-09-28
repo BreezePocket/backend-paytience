@@ -58,6 +58,44 @@ impl EligibleInstance {
     pub fn fresh_health(&self, window: Duration) -> Option<&HealthSnapshot> {
         self.health.as_ref().filter(|h| h.at.elapsed() <= window)
     }
+
+    /// Its fresh health says `dry_run: true`: it quotes but will not co-sign. An
+    /// instance without a fresh snapshot (e.g. just connected) counts as live.
+    pub fn is_dry_run(&self, window: Duration) -> bool {
+        self.fresh_health(window)
+            .is_some_and(|h| h.body.get("dry_run") == Some(&Value::Bool(true)))
+    }
+}
+
+/// Live over dry-run (§2.6, §2.1-2.5): the live instances if there are any, else the
+/// dry-run ones, so a dry-run-only setup still works. Order is kept.
+pub fn prefer_live(instances: Vec<EligibleInstance>, window: Duration) -> Vec<EligibleInstance> {
+    let (live, dry): (Vec<_>, Vec<_>) = instances.into_iter().partition(|i| !i.is_dry_run(window));
+    if live.is_empty() { dry } else { live }
+}
+
+/// One instance per pubkey, so one MM running two desks is not counted twice: the
+/// freshest health snapshot wins, else the newest connection. Pubkeys keep the order
+/// of their first instance in `instances`.
+pub fn representatives(instances: Vec<EligibleInstance>) -> Vec<EligibleInstance> {
+    let mut out: Vec<EligibleInstance> = Vec::new();
+    for inst in instances {
+        match out.iter_mut().find(|o| o.mm_pubkey == inst.mm_pubkey) {
+            None => out.push(inst),
+            Some(existing) => {
+                let better = match (&inst.health, &existing.health) {
+                    (Some(a), Some(b)) => a.at > b.at,
+                    (Some(_), None) => true,
+                    (None, Some(_)) => false,
+                    (None, None) => inst.rfq.id > existing.rfq.id,
+                };
+                if better {
+                    *existing = inst;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Per-pubkey counters (for `GET /admin/mms`).
@@ -169,28 +207,11 @@ impl Registry {
         out
     }
 
-    /// One eligible instance per pubkey for market data, so one MM running two desks
-    /// is not counted twice: the freshest health snapshot wins, else the newest
-    /// connection. Pubkeys are ordered by their oldest eligible instance.
-    pub fn market_representatives(&self) -> Vec<EligibleInstance> {
-        let mut out: Vec<EligibleInstance> = Vec::new();
-        for inst in self.eligible() {
-            match out.iter_mut().find(|o| o.mm_pubkey == inst.mm_pubkey) {
-                None => out.push(inst),
-                Some(existing) => {
-                    let better = match (&inst.health, &existing.health) {
-                        (Some(a), Some(b)) => a.at > b.at,
-                        (Some(_), None) => true,
-                        (None, Some(_)) => false,
-                        (None, None) => inst.rfq.id > existing.rfq.id,
-                    };
-                    if better {
-                        *existing = inst;
-                    }
-                }
-            }
-        }
-        out
+    /// One eligible instance per pubkey for market data ([`representatives`]), chosen
+    /// among the live instances if any ([`prefer_live`]); pubkeys are ordered by their
+    /// oldest such instance.
+    pub fn market_representatives(&self, fresh: Duration) -> Vec<EligibleInstance> {
+        representatives(prefer_live(self.eligible(), fresh))
     }
 
     /// The `ws/sign` connection of one instance, if connected.
@@ -314,7 +335,8 @@ mod tests {
         assert_eq!(signs[0].instance_id, "2");
         assert!(reg.sign_conns_for("c").is_empty());
 
-        let reps = reg.market_representatives();
+        let fresh = Duration::from_secs(30);
+        let reps = reg.market_representatives(fresh);
         assert_eq!(
             reps.iter()
                 .map(|r| r.mm_pubkey.as_str())
@@ -330,7 +352,7 @@ mod tests {
             .unwrap();
         reg.set_health(&inst1.rfq, json!({"ok": true}));
         assert_eq!(
-            reg.market_representatives()[0].instance_id,
+            reg.market_representatives(fresh)[0].instance_id,
             "1",
             "the instance with health wins"
         );
@@ -347,6 +369,49 @@ mod tests {
                 .body,
             json!({"ok": true})
         );
+    }
+
+    fn instance(reg: &Registry, pk: &str, inst: &str) -> EligibleInstance {
+        reg.eligible()
+            .into_iter()
+            .find(|i| i.mm_pubkey == pk && i.instance_id == inst)
+            .unwrap()
+    }
+
+    #[test]
+    fn live_instances_are_preferred_over_dry_run_ones() {
+        let reg = Registry::new();
+        let fresh = Duration::from_secs(30);
+        for (pk, inst) in [("a", "1"), ("a", "2"), ("b", "1")] {
+            reg.register(conn(&reg, pk, inst, Channel::Rfq));
+            reg.register(conn(&reg, pk, inst, Channel::Sign));
+        }
+        let ids = |v: Vec<EligibleInstance>| {
+            v.into_iter()
+                .map(|i| format!("{}{}", i.mm_pubkey, i.instance_id))
+                .collect::<Vec<_>>()
+        };
+        // a2 is dry-run and has the freshest health; a1 (no snapshot) counts as live.
+        reg.set_health(&instance(&reg, "b", "1").rfq, json!({"dry_run": false}));
+        reg.set_health(&instance(&reg, "a", "2").rfq, json!({"dry_run": true}));
+        assert!(instance(&reg, "a", "2").is_dry_run(fresh));
+        assert!(!instance(&reg, "a", "1").is_dry_run(fresh));
+        assert!(
+            !instance(&reg, "a", "2").is_dry_run(Duration::ZERO),
+            "stale counts as live"
+        );
+        assert_eq!(ids(prefer_live(reg.eligible(), fresh)), ["a1", "b1"]);
+        assert_eq!(
+            ids(reg.market_representatives(fresh)),
+            ["a1", "b1"],
+            "the live instance represents a, not the fresher dry-run one"
+        );
+
+        // Only dry-run instances left: they are used.
+        reg.set_health(&instance(&reg, "a", "1").rfq, json!({"dry_run": true}));
+        reg.set_health(&instance(&reg, "b", "1").rfq, json!({"dry_run": true}));
+        assert_eq!(ids(prefer_live(reg.eligible(), fresh)), ["a1", "a2", "b1"]);
+        assert_eq!(ids(reg.market_representatives(fresh)), ["a1", "b1"]);
     }
 
     #[test]

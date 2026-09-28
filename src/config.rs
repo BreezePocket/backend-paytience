@@ -1,6 +1,7 @@
 //! Backend configuration (contract §3). Every env var has a field here; the liveness,
-//! faucet-confirmation and rate-limit knobs at the bottom are contract constants, kept
-//! on the struct so tests can shrink them, and are not read from the environment.
+//! faucet-confirmation, rate-limit and WebSocket-limit knobs at the bottom are contract
+//! constants, kept on the struct so tests can shrink them, and are not read from the
+//! environment.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -133,6 +134,14 @@ pub struct Config {
     pub faucet_poll_interval: Duration,
     /// §2.10: per-IP limits per window.
     pub rate_limits: RateLimits,
+    /// §1.2: largest WebSocket message (and frame) accepted on `/ws/*`, before or
+    /// after authentication; a bigger one closes the connection.
+    pub ws_max_message_bytes: usize,
+    /// §1.2: sockets upgraded but not yet authenticated, across all clients; past
+    /// this, upgrades get 503.
+    pub ws_max_unauthenticated: usize,
+    /// §1.2: the same, per client IP (as §2.10 identifies it).
+    pub ws_max_unauthenticated_per_ip: usize,
 }
 
 /// §2.10 requests per client IP per fixed window, by route class.
@@ -143,6 +152,13 @@ pub struct RateLimits {
     pub sign: u32,
     pub faucet: u32,
     pub get: u32,
+    /// WebSocket upgrade attempts on `/ws/rfq` and `/ws/sign`.
+    pub ws: u32,
+    /// Upgrades from a process on this machine (a loopback peer with no
+    /// `CF-Connecting-IP`) skip both the `ws` limit and the unauthenticated-socket caps,
+    /// so a flood through the public tunnel can never lock out the house desk that
+    /// shares the VM. cloudflared also connects from loopback but always sets the header.
+    pub exempt_local_ws: bool,
 }
 
 impl Default for RateLimits {
@@ -153,6 +169,8 @@ impl Default for RateLimits {
             sign: 30,
             faucet: 10,
             get: 600,
+            ws: 60,
+            exempt_local_ws: true,
         }
     }
 }
@@ -187,6 +205,9 @@ impl Config {
             faucet_confirm_timeout: Duration::from_secs(30),
             faucet_poll_interval: Duration::from_millis(500),
             rate_limits: RateLimits::default(),
+            ws_max_message_bytes: 1 << 20,
+            ws_max_unauthenticated: 256,
+            ws_max_unauthenticated_per_ip: 8,
         }
     }
 
@@ -354,9 +375,12 @@ mod tests {
         assert_eq!(cfg.faucet_confirm_timeout, Duration::from_secs(30));
         let rl = cfg.rate_limits;
         assert_eq!(
-            (rl.window, rl.rfq, rl.sign, rl.faucet, rl.get),
-            (Duration::from_secs(60), 120, 30, 10, 600)
+            (rl.window, rl.rfq, rl.sign, rl.faucet, rl.get, rl.ws),
+            (Duration::from_secs(60), 120, 30, 10, 600, 60)
         );
+        assert_eq!(cfg.ws_max_message_bytes, 1024 * 1024);
+        assert_eq!(cfg.ws_max_unauthenticated, 256);
+        assert_eq!(cfg.ws_max_unauthenticated_per_ip, 8);
     }
 
     #[test]

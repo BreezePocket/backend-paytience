@@ -13,7 +13,8 @@ use paytience_backend::{Allowlist, AllowlistEntry, App, Config, serve};
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::{self, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 pub type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -87,6 +88,9 @@ pub fn test_config() -> Config {
     cfg.health_poll = Duration::from_secs(60);
     cfg.hello_timeout = Duration::from_secs(2);
     cfg.rpc_timeout = Duration::from_secs(2);
+    // Every test client connects from loopback without CF-Connecting-IP; count them like
+    // public clients unless a test is about the local-desk exemption.
+    cfg.rate_limits.exempt_local_ws = false;
     cfg
 }
 
@@ -167,7 +171,30 @@ impl TestServer {
         .await;
     }
 
-    /// Waits until `n` MMs have a fresh health snapshot.
+    /// Waits until `n` eligible instances have a fresh health snapshot, dry-run or not.
+    pub async fn wait_health(&self, n: usize) {
+        let fresh = self.app.config.health_fresh;
+        wait_until(
+            || {
+                self.app
+                    .registry
+                    .eligible()
+                    .iter()
+                    .filter(|i| i.fresh_health(fresh).is_some())
+                    .count()
+                    == n
+            },
+            "fresh health on every instance",
+        )
+        .await;
+    }
+
+    /// Waits until `n` unauthenticated sockets hold a pre-auth slot.
+    pub async fn wait_preauth(&self, n: usize) {
+        wait_until(|| self.app.preauth.open() == n, "pre-auth sockets").await;
+    }
+
+    /// Waits until `n` MMs have a fresh health snapshot (live ones preferred, §2.1).
     pub async fn wait_fresh(&self, n: usize) {
         wait_until(
             || paytience_backend::market::fresh_snapshots(&self.app).len() == n,
@@ -222,6 +249,21 @@ pub async fn read_until_close(ws: &mut Ws) -> (Option<u16>, Vec<Value>) {
             }
             Ok(Some(Ok(_))) => {}
         }
+    }
+}
+
+/// Opens a socket without authenticating, optionally as `ip` (CF-Connecting-IP);
+/// Err is the HTTP status of a refused upgrade.
+pub async fn upgrade(server: &TestServer, path: &str, ip: Option<&str>) -> Result<Ws, u16> {
+    let mut req = server.ws_url(path).into_client_request().unwrap();
+    if let Some(ip) = ip {
+        req.headers_mut()
+            .insert("cf-connecting-ip", ip.parse().unwrap());
+    }
+    match connect_async(req).await {
+        Ok((ws, _)) => Ok(ws),
+        Err(tungstenite::Error::Http(resp)) => Err(resp.status().as_u16()),
+        Err(e) => panic!("upgrade failed: {e}"),
     }
 }
 
@@ -335,6 +377,13 @@ pub fn desk_health(key: &MmKey, spot: f64, total_usd: f64) -> Value {
                       "perExpiry": { "1759824000": { "onChainUsd": total_usd, "reservedUsd": 0 } } },
         "stats": { "rfqs": 0 },
     })
+}
+
+/// A desk `/health` body from a `DRY_RUN=true` desk (quotes, never co-signs).
+pub fn dry_run_health(key: &MmKey, spot: f64) -> Value {
+    let mut h = desk_health(key, spot, 0.0);
+    h["dry_run"] = json!(true);
+    h
 }
 
 type Log = Arc<Mutex<Vec<(Channel, Value)>>>;
@@ -503,6 +552,8 @@ async fn run_channel(
 pub enum RpcReply {
     Result(Value),
     Error(String),
+    /// This HTTP status, with a JSON-RPC error body (a throttling or failing node).
+    Status(u16, String),
 }
 
 /// `(method, params, how many earlier calls of this method)` → reply.
@@ -535,7 +586,7 @@ impl MockRpc {
 async fn scripted_handler(
     axum::extract::State(rpc): axum::extract::State<ScriptedRpc>,
     body: axum::Json<Value>,
-) -> axum::Json<Value> {
+) -> (axum::http::StatusCode, axum::Json<Value>) {
     let method = body.0["method"].as_str().unwrap_or_default().to_string();
     let seen = {
         let mut calls = rpc.calls.lock().unwrap();
@@ -544,12 +595,16 @@ async fn scripted_handler(
         seen
     };
     let id = body.0["id"].clone();
-    axum::Json(match (rpc.script)(&method, &body.0["params"], seen) {
-        RpcReply::Result(r) => json!({ "jsonrpc": "2.0", "id": id, "result": r }),
-        RpcReply::Error(m) => {
-            json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32002, "message": m } })
-        }
-    })
+    let error = |code: i64, m: String| json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": m } });
+    let (status, body) = match (rpc.script)(&method, &body.0["params"], seen) {
+        RpcReply::Result(r) => (200, json!({ "jsonrpc": "2.0", "id": id, "result": r })),
+        RpcReply::Error(m) => (200, error(-32002, m)),
+        RpcReply::Status(status, m) => (status, error(i64::from(status), m)),
+    };
+    (
+        axum::http::StatusCode::from_u16(status).unwrap(),
+        axum::Json(body),
+    )
 }
 
 pub async fn scripted_rpc(

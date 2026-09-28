@@ -212,8 +212,22 @@ async fn server_pings_and_closes_silent_connections() {
     )
     .await;
     tokio::time::sleep(Duration::from_millis(700)).await;
+    // The server drops the silent connection...
+    let silent_gone = || {
+        server.app.registry.with_instances(|i| {
+            i.filter(|x| x.instance_id == "silent")
+                .all(|x| x.sign.is_none())
+        })
+    };
+    wait_until(silent_gone, "idle close of the silent connection").await;
+    // ...with CLOSE_IDLE. Under load the client can see a reset instead: when it
+    // resumes reading, tungstenite flushes its queued pongs into the closed socket,
+    // which may fail before the close frame is read.
     let (close, _) = read_until_close(&mut silent).await;
-    assert_eq!(close, Some(paytience_backend::ws::CLOSE_IDLE));
+    assert!(
+        close.is_none() || close == Some(paytience_backend::ws::CLOSE_IDLE),
+        "unexpected close code {close:?}"
+    );
 }
 
 #[tokio::test]
@@ -253,4 +267,198 @@ async fn server_answers_client_pings() {
             other => panic!("no pong: {other:?}"),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// §1.2 limits on unauthenticated sockets and message sizes
+
+/// Reads the challenge on a raw socket and authenticates it as `spec`.
+async fn authenticate(ws: &mut Ws, spec: &HelloSpec) {
+    let challenge = next_json(ws).await.unwrap();
+    let c = challenge["challenge"].as_str().unwrap().to_string();
+    send_json(ws, &spec.frame(&c)).await;
+    assert_eq!(next_json(ws).await.unwrap()["type"], "welcome");
+}
+
+#[tokio::test]
+async fn oversized_frame_before_hello_closes_4001_unparsed() {
+    let server = start(test_config()).await;
+    let big = "x".repeat(paytience_backend::ws::MAX_PREAUTH_FRAME_BYTES + 1);
+    for msg in [
+        Message::Text(format!("[{big}]").into()),
+        Message::Binary(big.clone().into_bytes().into()),
+    ] {
+        let (mut ws, _) = connect_async(server.ws_url("/ws/rfq")).await.unwrap();
+        ws.send(msg).await.unwrap();
+        let (close, frames) = read_until_close(&mut ws).await;
+        assert_eq!(close, Some(4001));
+        assert_eq!(frames[0]["type"], "challenge");
+        assert_eq!(
+            frames.last().unwrap(),
+            &json!({ "type": "error", "reason": "hello too large" })
+        );
+    }
+    // A frame at the limit is still just ignored, and the server is fine.
+    let (mut ws, _) = connect_async(server.ws_url("/ws/sign")).await.unwrap();
+    let padded = json!({ "type": "noise", "pad": "" }).to_string();
+    let pad = "y".repeat(paytience_backend::ws::MAX_PREAUTH_FRAME_BYTES - padded.len());
+    send_json(&mut ws, &json!({ "type": "noise", "pad": pad })).await;
+    authenticate(&mut ws, &HelloSpec::new(&key_a(), "i", Channel::Sign)).await;
+    server.wait_preauth(0).await;
+    assert_eq!(server.get("/health").await.0, 200);
+}
+
+#[tokio::test]
+async fn unauthenticated_sockets_are_capped_globally() {
+    let mut cfg = test_config();
+    cfg.hello_timeout = Duration::from_secs(10);
+    cfg.ws_max_unauthenticated = 2;
+    let server = start(cfg).await;
+    let mut first = upgrade(&server, "/ws/rfq", Some("203.0.113.1"))
+        .await
+        .unwrap();
+    let second = upgrade(&server, "/ws/sign", Some("203.0.113.2"))
+        .await
+        .unwrap();
+    server.wait_preauth(2).await;
+    assert_eq!(
+        upgrade(&server, "/ws/rfq", Some("203.0.113.3")).await.err(),
+        Some(503)
+    );
+
+    // Authenticating frees the slot...
+    authenticate(&mut first, &HelloSpec::new(&key_a(), "i", Channel::Rfq)).await;
+    server.wait_preauth(1).await;
+    let _third = upgrade(&server, "/ws/rfq", Some("203.0.113.3"))
+        .await
+        .unwrap();
+    server.wait_preauth(2).await;
+    assert_eq!(
+        upgrade(&server, "/ws/sign", Some("203.0.113.4"))
+            .await
+            .err(),
+        Some(503)
+    );
+    // ...and so does closing.
+    drop(second);
+    server.wait_preauth(1).await;
+    assert!(
+        upgrade(&server, "/ws/sign", Some("203.0.113.4"))
+            .await
+            .is_ok()
+    );
+    // Authenticated sockets never counted.
+    assert_eq!(server.app.registry.with_instances(|i| i.count()), 1);
+}
+
+#[tokio::test]
+async fn unauthenticated_sockets_are_capped_per_client_ip() {
+    let mut cfg = test_config();
+    cfg.hello_timeout = Duration::from_secs(10);
+    cfg.ws_max_unauthenticated_per_ip = 2;
+    let server = start(cfg).await;
+    let a = upgrade(&server, "/ws/rfq", None).await.unwrap();
+    let _b = upgrade(&server, "/ws/sign", None).await.unwrap();
+    assert_eq!(upgrade(&server, "/ws/rfq", None).await.err(), Some(503));
+    // Another client behind the tunnel has its own slots; a non-IP header does not.
+    let _c = upgrade(&server, "/ws/rfq", Some("203.0.113.9"))
+        .await
+        .unwrap();
+    assert_eq!(
+        upgrade(&server, "/ws/rfq", Some("not-an-ip")).await.err(),
+        Some(503)
+    );
+    assert_eq!(server.app.preauth.open_for("127.0.0.1"), 2);
+
+    drop(a);
+    wait_until(
+        || server.app.preauth.open_for("127.0.0.1") == 1,
+        "slot release",
+    )
+    .await;
+    assert!(upgrade(&server, "/ws/rfq", None).await.is_ok());
+}
+
+#[tokio::test]
+async fn hello_timeout_frees_the_slot() {
+    let mut cfg = test_config();
+    cfg.hello_timeout = Duration::from_millis(200);
+    cfg.ws_max_unauthenticated = 1;
+    let server = start(cfg).await;
+    let mut ws = upgrade(&server, "/ws/rfq", None).await.unwrap();
+    assert_eq!(upgrade(&server, "/ws/rfq", None).await.err(), Some(503));
+    assert_eq!(read_until_close(&mut ws).await.0, Some(4001));
+    server.wait_preauth(0).await;
+    assert!(upgrade(&server, "/ws/rfq", None).await.is_ok());
+}
+
+#[tokio::test]
+async fn message_over_the_cap_disconnects_an_authenticated_mm() {
+    let mut cfg = test_config();
+    cfg.ws_max_message_bytes = 64 * 1024;
+    cfg.market_timeout = Duration::from_secs(10);
+    let server = start(cfg).await;
+    let pad = "z".repeat(100 * 1024);
+    let _mm = FakeMm::builder(&key_a(), "i1")
+        .on_rfq(move |req| Action::Reply(market_ok(req, json!({ "pad": pad }))))
+        .connect(&server)
+        .await;
+    server.wait_eligible(1).await;
+
+    // The pending board request fails at once, not after the 10 s market timeout.
+    let started = std::time::Instant::now();
+    let (status, body) = server.get("/board").await;
+    assert_eq!(
+        (status, body),
+        (503, json!({ "error": "market maker disconnected" }))
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    // Its rfq connection is gone, so the instance is no longer eligible.
+    server.wait_eligible(0).await;
+
+    // The server is fine: another MM connects and is served.
+    let _other = FakeMm::builder(&key_b(), "i1").connect(&server).await;
+    server.wait_eligible(1).await;
+    assert_eq!(server.get("/health").await.0, 200);
+}
+
+#[tokio::test]
+async fn a_desk_on_this_machine_skips_the_public_caps() {
+    // With the exemption on (the production default), a loopback client with no
+    // CF-Connecting-IP (the house desk on the VM) takes no unauthenticated slot and no
+    // upgrade budget, so a flood through the tunnel cannot lock it out.
+    let mut cfg = test_config();
+    cfg.hello_timeout = Duration::from_secs(10);
+    cfg.ws_max_unauthenticated = 1;
+    cfg.ws_max_unauthenticated_per_ip = 1;
+    cfg.rate_limits.ws = 1;
+    cfg.rate_limits.exempt_local_ws = true;
+    let server = start(cfg).await;
+
+    // A public client fills the only slot and spends its upgrade budget.
+    let _public = upgrade(&server, "/ws/rfq", Some("203.0.113.1"))
+        .await
+        .unwrap();
+    server.wait_preauth(1).await;
+    assert_eq!(
+        upgrade(&server, "/ws/rfq", Some("203.0.113.2")).await.err(),
+        Some(503),
+        "the public pool is full"
+    );
+    assert_eq!(
+        upgrade(&server, "/ws/rfq", Some("203.0.113.1")).await.err(),
+        Some(429),
+        "and that client's upgrade budget is spent"
+    );
+
+    // Local sockets still get in, beyond both caps and the budget, and hold no slot.
+    let _l1 = upgrade(&server, "/ws/rfq", None).await.unwrap();
+    let _l2 = upgrade(&server, "/ws/sign", None).await.unwrap();
+    assert_eq!(server.app.preauth.open(), 1);
+    let _desk = FakeMm::builder(&key_a(), "house").connect(&server).await;
+    server.wait_eligible(1).await;
 }

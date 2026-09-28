@@ -11,6 +11,7 @@ use serde_json::{Map, Value, json};
 use crate::config::is_pubkey;
 use crate::conn::RequestError;
 use crate::protocol::{id_string, new_id, parse_u64, rfq_decline};
+use crate::registry::prefer_live;
 use crate::state::App;
 use crate::stats::Stats;
 
@@ -259,7 +260,8 @@ impl WinnerMemory {
 /// Runs the auction; returns the HTTP status and typed body.
 pub async fn run(app: &App, rfq: &ValidRfq) -> (u16, Value) {
     Stats::inc(&app.stats.rfqs);
-    let targets = app.registry.eligible();
+    // Dry-run MMs quote but never co-sign: ask them only when no live MM is eligible.
+    let targets = prefer_live(app.registry.eligible(), app.config.health_fresh);
     if targets.is_empty() {
         Stats::inc(&app.stats.declined);
         return (503, rfq_decline(&rfq.rfq_id, "no market maker is online"));

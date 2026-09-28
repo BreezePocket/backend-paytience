@@ -15,6 +15,8 @@ async fn limited(window: Duration) -> TestServer {
         sign: 2,
         faucet: 1,
         get: 3,
+        ws: 4,
+        exempt_local_ws: false,
     };
     start(cfg).await
 }
@@ -72,7 +74,7 @@ async fn each_class_has_its_own_limit() {
 }
 
 #[tokio::test]
-async fn options_and_websocket_upgrades_are_not_limited() {
+async fn options_pass_and_websocket_upgrades_have_their_own_budget() {
     let server = limited(MINUTE).await;
     for _ in 0..3 {
         send(&server, reqwest::Method::GET, "/health", None).await;
@@ -89,10 +91,26 @@ async fn options_and_websocket_upgrades_are_not_limited() {
             204
         );
     }
-    // Both sockets are GET upgrades from the same (exhausted) IP.
+    // Four GET upgrades from the same IP, whose GET budget is spent: the WS budget is
+    // separate.
     let _a = FakeMm::builder(&key_a(), "i1").connect(&server).await;
     let _b = FakeMm::builder(&key_b(), "i1").connect(&server).await;
     server.wait_eligible(2).await;
+    // The fifth upgrade in the window is refused before upgrading.
+    assert_eq!(upgrade(&server, "/ws/rfq", None).await.err(), Some(429));
+    assert_eq!(upgrade(&server, "/ws/sign", None).await.err(), Some(429));
+    assert!(
+        upgrade(&server, "/ws/sign", Some("203.0.113.5"))
+            .await
+            .is_ok()
+    );
+    // POSTs to paths without a class are not counted.
+    for _ in 0..5 {
+        assert_eq!(
+            send(&server, reqwest::Method::POST, "/nope", None).await.0,
+            404
+        );
+    }
 }
 
 #[tokio::test]

@@ -1,12 +1,16 @@
 //! `/ws/rfq` and `/ws/sign` (contract §1): challenge → hello → welcome, then a reader
 //! loop that hands replies to their waiting requests, and a writer task that owns the
-//! socket's send half and pings it.
+//! socket's send half and pings it. Upgrades take an unauthenticated-socket slot and
+//! cap message size; frames over 16 KiB before the hello are refused unparsed (§1.2).
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::State;
+use axum::Extension;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{ConnectInfo, State};
+use axum::http::HeaderMap;
 use axum::response::Response;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
@@ -16,23 +20,80 @@ use tokio::task::JoinHandle;
 
 use crate::auth::{self, AuthError, CLOSE_BAD_HELLO, CLOSE_REPLACED, Expected};
 use crate::conn::{Conn, ConnInfo, Outbound};
+use crate::http::json_response;
 use crate::market::health_poller;
-use crate::protocol::{Channel, now_ms, random_challenge};
+use crate::preauth::{PreauthPermit, Refused};
+use crate::protocol::{Channel, error_body, now_ms, random_challenge};
+use crate::ratelimit::{client_key, is_local};
 use crate::state::App;
 
 /// Close code for a connection that went silent (§1.3 names none).
 pub const CLOSE_IDLE: u16 = 4008;
+/// §1.2: a frame this large before authentication is refused unparsed (a hello is
+/// well under 1 KiB).
+pub const MAX_PREAUTH_FRAME_BYTES: usize = 16 * 1024;
 const WRITER_GRACE: Duration = Duration::from_secs(1);
 
-pub async fn ws_rfq(State(app): State<Arc<App>>, ws: WebSocketUpgrade) -> Response {
-    ws.on_upgrade(move |socket| handle_socket(app, Channel::Rfq, socket))
+type Peer = Option<Extension<ConnectInfo<SocketAddr>>>;
+
+pub async fn ws_rfq(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    peer: Peer,
+    ws: WebSocketUpgrade,
+) -> Response {
+    upgrade(app, Channel::Rfq, &headers, peer, ws)
 }
 
-pub async fn ws_sign(State(app): State<Arc<App>>, ws: WebSocketUpgrade) -> Response {
-    ws.on_upgrade(move |socket| handle_socket(app, Channel::Sign, socket))
+pub async fn ws_sign(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    peer: Peer,
+    ws: WebSocketUpgrade,
+) -> Response {
+    upgrade(app, Channel::Sign, &headers, peer, ws)
 }
 
-async fn handle_socket(app: Arc<App>, channel: Channel, socket: WebSocket) {
+/// Takes an unauthenticated-socket slot (else 503 without upgrading) and upgrades with
+/// the message cap; the slot travels with the socket until its hello is verified. A
+/// desk on this machine (the house desk) takes no slot, so a flood through the public
+/// tunnel cannot keep it from reconnecting.
+fn upgrade(
+    app: Arc<App>,
+    channel: Channel,
+    headers: &HeaderMap,
+    peer: Peer,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let peer = peer.map(|Extension(ConnectInfo(addr))| addr);
+    let permit = if app.config.rate_limits.exempt_local_ws && is_local(headers, peer) {
+        None
+    } else {
+        let client = client_key(headers, peer);
+        match app.preauth.admit(&client) {
+            Ok(p) => Some(p),
+            Err(why) => {
+                let reason = match why {
+                    Refused::Global => "too many unauthenticated connections",
+                    Refused::PerIp => "too many unauthenticated connections from this client",
+                };
+                tracing::info!(%client, channel = channel.as_str(), "refusing upgrade: {reason}");
+                return json_response(503, &error_body(reason));
+            }
+        }
+    };
+    let cap = app.config.ws_max_message_bytes;
+    ws.max_message_size(cap)
+        .max_frame_size(cap)
+        .on_upgrade(move |socket| handle_socket(app, channel, socket, permit))
+}
+
+async fn handle_socket(
+    app: Arc<App>,
+    channel: Channel,
+    socket: WebSocket,
+    permit: Option<PreauthPermit>,
+) {
     let (sink, mut stream) = socket.split();
     let (out_tx, out_rx) = mpsc::unbounded_channel();
     let writer = tokio::spawn(write_loop(sink, out_rx, app.config.ping_interval));
@@ -62,9 +123,15 @@ async fn handle_socket(app: Arc<App>, channel: Channel, socket: WebSocket) {
                 code: CLOSE_BAD_HELLO,
                 reason: "no valid hello within the time limit".into(),
             }),
-            Ok(None) => return finish_with(out_tx, writer).await, // peer went away
-            Ok(Some(hello)) => auth::verify_hello(&hello, &expected),
+            Ok(Hello::Closed) => return finish_with(out_tx, writer).await, // peer went away
+            Ok(Hello::TooLarge) => Err(AuthError {
+                code: CLOSE_BAD_HELLO,
+                reason: "hello too large".into(),
+            }),
+            Ok(Hello::Frame(hello)) => auth::verify_hello(&hello, &expected),
         };
+    // Verified or refused: either way this socket no longer counts as unauthenticated.
+    drop(permit);
     let authed = match verdict {
         Ok(a) => a,
         Err(e) => {
@@ -116,22 +183,31 @@ fn text(v: &Value) -> Outbound {
     Outbound::Text(v.to_string())
 }
 
-/// Waits for the first `hello` frame; anything else before it is ignored.
-async fn read_hello(stream: &mut SplitStream<WebSocket>) -> Option<Value> {
+enum Hello {
+    Frame(Value),
+    /// A frame over [`MAX_PREAUTH_FRAME_BYTES`], refused without parsing.
+    TooLarge,
+    Closed,
+}
+
+/// Waits for the first `hello` frame; smaller frames before it are ignored.
+async fn read_hello(stream: &mut SplitStream<WebSocket>) -> Hello {
     while let Some(Ok(msg)) = stream.next().await {
         match msg {
+            Message::Text(t) if t.len() > MAX_PREAUTH_FRAME_BYTES => return Hello::TooLarge,
+            Message::Binary(b) if b.len() > MAX_PREAUTH_FRAME_BYTES => return Hello::TooLarge,
             Message::Text(t) => {
                 if let Ok(v) = serde_json::from_str::<Value>(t.as_str())
                     && v.get("type").and_then(Value::as_str) == Some("hello")
                 {
-                    return Some(v);
+                    return Hello::Frame(v);
                 }
             }
-            Message::Close(_) => return None,
+            Message::Close(_) => return Hello::Closed,
             _ => {}
         }
     }
-    None
+    Hello::Closed
 }
 
 async fn read_loop(app: &App, conn: &Conn, stream: &mut SplitStream<WebSocket>) {
@@ -144,7 +220,12 @@ async fn read_loop(app: &App, conn: &Conn, stream: &mut SplitStream<WebSocket>) 
                     conn.close(CLOSE_IDLE, "idle timeout");
                     return;
                 }
-                Ok(None) | Ok(Some(Err(_))) | Ok(Some(Ok(Message::Close(_)))) => return,
+                Ok(None) | Ok(Some(Ok(Message::Close(_)))) => return,
+                Ok(Some(Err(e))) => {
+                    // Includes a message over the size cap (§1.2).
+                    tracing::info!(mm = %conn.name, channel = conn.channel.as_str(), "closing connection after a read error: {e}");
+                    return;
+                }
                 Ok(Some(Ok(Message::Text(t)))) => on_text(conn, t.as_str()),
                 Ok(Some(Ok(_))) => {} // ping, pong, binary: liveness only
             },

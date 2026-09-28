@@ -23,7 +23,7 @@ use solana_transaction::Transaction;
 
 use crate::market;
 use crate::protocol::{as_f64, num};
-use crate::solana_rpc::SolanaRpc;
+use crate::solana_rpc::{RpcError, SolanaRpc};
 use crate::state::App;
 
 /// SPL Token (legacy) program.
@@ -45,18 +45,55 @@ const COOLDOWN_SWEEP_AT: usize = 4096;
 
 pub const DISABLED: &str = "faucet disabled";
 
-/// An HTTP status and `{error}` message.
+/// The 502 message when a mint may still land; the cooldown slot is kept.
+pub const OUTCOME_UNKNOWN: &str = "faucet mint outcome unknown; try again after the cooldown";
+/// What callers see for an RPC transport failure; the detail is only logged.
+pub const RPC_UNAVAILABLE: &str = "rpc unavailable";
+/// What a caller sees when the RPC rate-limited us; nothing was sent, so they may retry.
+pub const RPC_BUSY: &str = "rpc busy; try again shortly";
+
+/// An HTTP status and `{error}` message, plus the mint's `signature` when a mint was
+/// sent but its outcome is unknown.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FaucetError {
     pub status: u16,
     pub message: String,
+    pub signature: Option<String>,
 }
 
 fn err(status: u16, message: impl Into<String>) -> FaucetError {
     FaucetError {
         status,
         message: message.into(),
+        signature: None,
     }
+}
+
+/// Why a mint did not complete (§2.8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MintError {
+    /// Definitely not minted (nothing was sent, the node refused it, or it failed on
+    /// chain), so the cooldown slot is released. The message is safe to show.
+    Failed(String),
+    /// Sent, or perhaps sent, and not known to have failed: it may still land, so the
+    /// cooldown slot is kept.
+    Unknown { signature: Option<String> },
+}
+
+/// The part of an RPC error a caller may see: the node's own message, else nothing
+/// about the transport (its detail is logged where it is swallowed).
+fn public_rpc_error(e: &RpcError) -> String {
+    match e {
+        RpcError::Rpc { message, .. } => message.clone(),
+        RpcError::Throttled(_) => RPC_BUSY.to_string(),
+        RpcError::Transport(_) | RpcError::InvalidResponse(_) => RPC_UNAVAILABLE.to_string(),
+    }
+}
+
+enum ConfirmError {
+    /// The transaction failed on chain.
+    Failed(String),
+    TimedOut,
 }
 
 // ---------------------------------------------------------------------------
@@ -381,10 +418,21 @@ impl Faucet {
         })?;
         let signature = match self.mint(app, &owner, &claim).await {
             Ok(sig) => sig,
-            Err(e) => {
+            Err(MintError::Failed(why)) => {
                 self.cooldowns.release(&key, token);
-                tracing::warn!(owner = %owner, asset = %claim.symbol, "faucet mint failed: {e}");
-                return Err(err(502, format!("faucet mint failed: {e}")));
+                tracing::warn!(owner = %owner, asset = %claim.symbol, "faucet mint failed: {why}");
+                return Err(err(502, format!("faucet mint failed: {why}")));
+            }
+            Err(MintError::Unknown { signature }) => {
+                // The mint may still land: releasing the slot would allow a double mint.
+                tracing::warn!(
+                    owner = %owner, asset = %claim.symbol, signature = signature.as_deref().unwrap_or("-"),
+                    "faucet mint outcome unknown; keeping the cooldown"
+                );
+                return Err(FaucetError {
+                    signature,
+                    ..err(502, OUTCOME_UNKNOWN)
+                });
             }
         };
 
@@ -422,33 +470,52 @@ impl Faucet {
     }
 
     /// Blockhash, sign, send, then wait for `confirmed`.
-    async fn mint(&self, app: &App, owner: &Pubkey, claim: &Claim) -> Result<String, String> {
+    async fn mint(&self, app: &App, owner: &Pubkey, claim: &Claim) -> Result<String, MintError> {
         let rpc = &app.rpc;
-        let blockhash = rpc
-            .get_latest_blockhash()
-            .await
-            .map_err(|e| e.to_string())?;
-        let blockhash =
-            Hash::from_str(&blockhash).map_err(|_| "rpc returned an invalid blockhash")?;
+        let blockhash = rpc.get_latest_blockhash().await.map_err(|e| {
+            tracing::warn!("faucet blockhash fetch failed: {e}");
+            MintError::Failed(public_rpc_error(&e))
+        })?;
+        let blockhash = Hash::from_str(&blockhash)
+            .map_err(|_| MintError::Failed("rpc returned an invalid blockhash".into()))?;
         let tx = build_mint_tx(
             &self.authority,
             owner,
             &claim.mint,
             claim.base_units,
             blockhash,
-        )?;
-        let signature = rpc
-            .send_transaction(&encode_tx(&tx)?)
-            .await
-            .map_err(|e| e.to_string())?;
-        confirm(
+        )
+        .map_err(MintError::Failed)?;
+        let wire = encode_tx(&tx).map_err(MintError::Failed)?;
+        let signature = match rpc.send_transaction(&wire).await {
+            Ok(sig) => sig,
+            // The node refused it (e.g. preflight): it will not land.
+            Err(RpcError::Rpc { message, .. }) => return Err(MintError::Failed(message)),
+            // A rate limiter refused it before the node saw it: it will not land either,
+            // so the caller keeps no cooldown for it.
+            Err(RpcError::Throttled(_)) => return Err(MintError::Failed(RPC_BUSY.to_string())),
+            Err(e) => {
+                // The node may have taken it before the reply was lost.
+                tracing::warn!("faucet sendTransaction outcome unknown: {e}");
+                return Err(MintError::Unknown {
+                    signature: tx.signatures.first().map(ToString::to_string),
+                });
+            }
+        };
+        match confirm(
             rpc,
             &signature,
             app.config.faucet_confirm_timeout,
             app.config.faucet_poll_interval,
         )
-        .await?;
-        Ok(signature)
+        .await
+        {
+            Ok(()) => Ok(signature),
+            Err(ConfirmError::Failed(why)) => Err(MintError::Failed(why)),
+            Err(ConfirmError::TimedOut) => Err(MintError::Unknown {
+                signature: Some(signature),
+            }),
+        }
     }
 }
 
@@ -466,23 +533,26 @@ async fn confirm(
     signature: &str,
     timeout: Duration,
     interval: Duration,
-) -> Result<(), String> {
+) -> Result<(), ConfirmError> {
     let deadline = Instant::now() + timeout;
     loop {
         match rpc.get_signature_status(signature).await {
             Ok(Some(status)) if status.err.as_ref().is_some_and(|e| !e.is_null()) => {
                 let why = status.err.unwrap_or_default();
-                return Err(format!("transaction {signature} failed: {why}"));
+                return Err(ConfirmError::Failed(format!(
+                    "transaction {signature} failed: {why}"
+                )));
             }
             Ok(Some(status)) if status.is_confirmed() => return Ok(()),
             Ok(_) => {}
             Err(e) => tracing::debug!("signature status poll failed: {e}"),
         }
         if Instant::now() + interval > deadline {
-            return Err(format!(
+            tracing::warn!(
                 "transaction {signature} not confirmed within {} s",
                 timeout.as_secs_f64()
-            ));
+            );
+            return Err(ConfirmError::TimedOut);
         }
         tokio::time::sleep(interval).await;
     }
