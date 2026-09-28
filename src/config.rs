@@ -1,0 +1,397 @@
+//! Backend configuration (contract §3). Every env var has a field here; the liveness,
+//! faucet-confirmation and rate-limit knobs at the bottom are contract constants, kept
+//! on the struct so tests can shrink them, and are not read from the environment.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use thiserror::Error;
+
+pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8080";
+pub const DEFAULT_SOLANA_RPC: &str = "https://api.devnet.solana.com";
+pub const DEFAULT_PROGRAM_ID: &str = "BeytdpJYSGP1oFRxEiBLkSRGuW6HW3Pk9dqSZCuSteQ9";
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ConfigError {
+    #[error("{0} is required")]
+    Missing(&'static str),
+    #[error("{key} is invalid: {why}")]
+    Invalid { key: &'static str, why: String },
+}
+
+fn invalid(key: &'static str, why: impl Into<String>) -> ConfigError {
+    ConfigError::Invalid {
+        key,
+        why: why.into(),
+    }
+}
+
+/// One allowlisted market maker: its display name and base58 pubkey.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllowlistEntry {
+    pub name: String,
+    pub pubkey: String,
+}
+
+/// `MM_ALLOWLIST`: `name:pubkey,name:pubkey`; a bare `pubkey` is named by its first 8 chars.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Allowlist {
+    entries: Vec<AllowlistEntry>,
+}
+
+impl Allowlist {
+    pub fn parse(raw: &str) -> Result<Self, ConfigError> {
+        let mut entries: Vec<AllowlistEntry> = Vec::new();
+        for item in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            // Pubkeys never contain ':', so the last one separates name from key.
+            let (name, pubkey) = match item.rsplit_once(':') {
+                Some((name, pubkey)) => (name.trim().to_string(), pubkey.trim().to_string()),
+                None => (String::new(), item.to_string()),
+            };
+            if !is_pubkey(&pubkey) {
+                return Err(invalid(
+                    "MM_ALLOWLIST",
+                    format!("{pubkey:?} is not a base58 pubkey"),
+                ));
+            }
+            if entries.iter().any(|e| e.pubkey == pubkey) {
+                return Err(invalid("MM_ALLOWLIST", format!("{pubkey} is listed twice")));
+            }
+            let name = if name.is_empty() {
+                pubkey.chars().take(8).collect()
+            } else {
+                name
+            };
+            entries.push(AllowlistEntry { name, pubkey });
+        }
+        if entries.is_empty() {
+            return Err(invalid("MM_ALLOWLIST", "no market makers listed"));
+        }
+        Ok(Self { entries })
+    }
+
+    pub fn from_entries(entries: Vec<AllowlistEntry>) -> Self {
+        Self { entries }
+    }
+
+    pub fn entries(&self) -> &[AllowlistEntry] {
+        &self.entries
+    }
+
+    pub fn name_of(&self, pubkey: &str) -> Option<&str> {
+        self.entries
+            .iter()
+            .find(|e| e.pubkey == pubkey)
+            .map(|e| e.name.as_str())
+    }
+
+    pub fn contains(&self, pubkey: &str) -> bool {
+        self.name_of(pubkey).is_some()
+    }
+}
+
+/// True for a base58 string that decodes to exactly 32 bytes.
+pub fn is_pubkey(s: &str) -> bool {
+    matches!(bs58::decode(s).into_vec(), Ok(bytes) if bytes.len() == 32)
+}
+
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub bind_addr: String,
+    pub solana_rpc: String,
+    pub program_id: String,
+    pub usdc_mint: String,
+    pub allowlist: Allowlist,
+    pub rfq_timeout: Duration,
+    pub sign_timeout: Duration,
+    pub market_timeout: Duration,
+    pub health_poll: Duration,
+    pub board_cache_ttl: Duration,
+    pub expiries_cache_ttl: Duration,
+    pub broadcast: bool,
+    pub faucet_keypair: Option<PathBuf>,
+    pub faucet_amount_usdc: f64,
+    pub faucet_asset_usd: f64,
+    pub faucet_sol_airdrop: f64,
+    pub faucet_cooldown: Duration,
+    pub admin_token: Option<String>,
+
+    /// §1.2: a connection without a valid `hello` by then is closed (4001).
+    pub hello_timeout: Duration,
+    /// §1.3: server ping interval on every connection.
+    pub ping_interval: Duration,
+    /// §1.3: a connection that sent no frame (pong included) for this long is closed.
+    pub idle_timeout: Duration,
+    /// §2: a `health` snapshot younger than this is "fresh".
+    pub health_fresh: Duration,
+    /// Solana JSON-RPC request timeout.
+    pub rpc_timeout: Duration,
+    /// §2.8: how long a faucet mint may take to reach `confirmed`.
+    pub faucet_confirm_timeout: Duration,
+    /// §2.8: `getSignatureStatuses` poll interval while waiting for confirmation.
+    pub faucet_poll_interval: Duration,
+    /// §2.10: per-IP limits per window.
+    pub rate_limits: RateLimits,
+}
+
+/// §2.10 requests per client IP per fixed window, by route class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateLimits {
+    pub window: Duration,
+    pub rfq: u32,
+    pub sign: u32,
+    pub faucet: u32,
+    pub get: u32,
+}
+
+impl Default for RateLimits {
+    fn default() -> Self {
+        Self {
+            window: Duration::from_secs(60),
+            rfq: 120,
+            sign: 30,
+            faucet: 10,
+            get: 600,
+        }
+    }
+}
+
+impl Config {
+    /// Contract defaults for everything except the two required values.
+    pub fn new(usdc_mint: impl Into<String>, allowlist: Allowlist) -> Self {
+        Self {
+            bind_addr: DEFAULT_BIND_ADDR.to_string(),
+            solana_rpc: DEFAULT_SOLANA_RPC.to_string(),
+            program_id: DEFAULT_PROGRAM_ID.to_string(),
+            usdc_mint: usdc_mint.into(),
+            allowlist,
+            rfq_timeout: Duration::from_millis(1000),
+            sign_timeout: Duration::from_millis(10_000),
+            market_timeout: Duration::from_millis(2500),
+            health_poll: Duration::from_millis(5000),
+            board_cache_ttl: Duration::from_millis(5000),
+            expiries_cache_ttl: Duration::from_millis(30_000),
+            broadcast: true,
+            faucet_keypair: None,
+            faucet_amount_usdc: 1000.0,
+            faucet_asset_usd: 1000.0,
+            faucet_sol_airdrop: 0.5,
+            faucet_cooldown: Duration::from_millis(3_600_000),
+            admin_token: None,
+            hello_timeout: Duration::from_secs(10),
+            ping_interval: Duration::from_secs(20),
+            idle_timeout: Duration::from_secs(60),
+            health_fresh: Duration::from_secs(30),
+            rpc_timeout: Duration::from_secs(10),
+            faucet_confirm_timeout: Duration::from_secs(30),
+            faucet_poll_interval: Duration::from_millis(500),
+            rate_limits: RateLimits::default(),
+        }
+    }
+
+    pub fn from_env() -> Result<Self, ConfigError> {
+        Self::from_lookup(|key| std::env::var(key).ok())
+    }
+
+    pub fn from_map(map: &HashMap<String, String>) -> Result<Self, ConfigError> {
+        Self::from_lookup(|key| map.get(key).cloned())
+    }
+
+    /// Builds the config from any key lookup; empty values count as unset.
+    pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
+        let get = |key: &str| {
+            lookup(key)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+
+        let usdc_mint = get("USDC_MINT").ok_or(ConfigError::Missing("USDC_MINT"))?;
+        if !is_pubkey(&usdc_mint) {
+            return Err(invalid("USDC_MINT", "not a base58 pubkey"));
+        }
+        let allowlist =
+            Allowlist::parse(&get("MM_ALLOWLIST").ok_or(ConfigError::Missing("MM_ALLOWLIST"))?)?;
+        let mut cfg = Self::new(usdc_mint, allowlist);
+
+        if let Some(v) = get("BIND_ADDR") {
+            cfg.bind_addr = v;
+        }
+        if let Some(v) = get("SOLANA_RPC") {
+            cfg.solana_rpc = v;
+        }
+        if let Some(v) = get("PROGRAM_ID") {
+            if !is_pubkey(&v) {
+                return Err(invalid("PROGRAM_ID", "not a base58 pubkey"));
+            }
+            cfg.program_id = v;
+        }
+        let ms = |key: &'static str, dflt: Duration| -> Result<Duration, ConfigError> {
+            match get(key) {
+                None => Ok(dflt),
+                Some(v) => match v.parse::<u64>() {
+                    Ok(n) if n > 0 => Ok(Duration::from_millis(n)),
+                    _ => Err(invalid(
+                        key,
+                        format!("expected a positive integer of milliseconds, got {v:?}"),
+                    )),
+                },
+            }
+        };
+        let num = |key: &'static str, dflt: f64| -> Result<f64, ConfigError> {
+            match get(key) {
+                None => Ok(dflt),
+                Some(v) => match v.parse::<f64>() {
+                    Ok(n) if n.is_finite() && n >= 0.0 => Ok(n),
+                    _ => Err(invalid(
+                        key,
+                        format!("expected a non-negative number, got {v:?}"),
+                    )),
+                },
+            }
+        };
+        cfg.rfq_timeout = ms("RFQ_TIMEOUT_MS", cfg.rfq_timeout)?;
+        cfg.sign_timeout = ms("SIGN_TIMEOUT_MS", cfg.sign_timeout)?;
+        cfg.market_timeout = ms("MARKET_TIMEOUT_MS", cfg.market_timeout)?;
+        cfg.health_poll = ms("HEALTH_POLL_MS", cfg.health_poll)?;
+        cfg.board_cache_ttl = ms("BOARD_CACHE_MS", cfg.board_cache_ttl)?;
+        cfg.expiries_cache_ttl = ms("EXPIRIES_CACHE_MS", cfg.expiries_cache_ttl)?;
+        cfg.faucet_cooldown = ms("FAUCET_COOLDOWN_MS", cfg.faucet_cooldown)?;
+        if let Some(v) = get("BROADCAST") {
+            cfg.broadcast = parse_bool(&v)
+                .ok_or_else(|| invalid("BROADCAST", format!("expected true/false, got {v:?}")))?;
+        }
+        cfg.faucet_keypair = get("FAUCET_KEYPAIR").map(PathBuf::from);
+        cfg.faucet_amount_usdc = num("FAUCET_AMOUNT_USDC", cfg.faucet_amount_usdc)?;
+        cfg.faucet_asset_usd = num("FAUCET_ASSET_USD", cfg.faucet_asset_usd)?;
+        cfg.faucet_sol_airdrop = num("FAUCET_SOL_AIRDROP", cfg.faucet_sol_airdrop)?;
+        cfg.admin_token = get("ADMIN_TOKEN");
+        Ok(cfg)
+    }
+}
+
+/// Same spellings the desk accepts (`1/true/yes/on`), plus their negatives.
+fn parse_bool(v: &str) -> Option<bool> {
+    match v.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const A: &str = "AKnL4NNf3DGWZJS6cPknBuEGnVsV4A4m5tgebLHaRSZ9";
+    const B: &str = "9hSR6S7WPtxmTojgo6GG3k4yDPecgJY292j7xrsUGWBu";
+    const MINT: &str = "EdmxWPmx2WH6WgFfTdu9xfkYf3k1g5wD1zccTVySEEh1";
+
+    fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn allowlist_names_and_bare_pubkeys() {
+        let list = Allowlist::parse(&format!(" alpha:{A} , {B},")).unwrap();
+        assert_eq!(list.entries().len(), 2);
+        assert_eq!(list.name_of(A), Some("alpha"));
+        assert_eq!(list.name_of(B), Some("9hSR6S7W"));
+        assert!(!list.contains(MINT));
+    }
+
+    #[test]
+    fn allowlist_rejects_bad_input() {
+        assert!(Allowlist::parse("").is_err());
+        assert!(Allowlist::parse(" , ").is_err());
+        assert!(Allowlist::parse("alpha:notakey").is_err());
+        assert!(Allowlist::parse("alpha:1111").is_err());
+        assert!(Allowlist::parse(&format!("a:{A},b:{A}")).is_err());
+    }
+
+    #[test]
+    fn requires_usdc_mint_and_allowlist() {
+        assert_eq!(
+            Config::from_map(&map(&[("MM_ALLOWLIST", A)])).unwrap_err(),
+            ConfigError::Missing("USDC_MINT")
+        );
+        assert_eq!(
+            Config::from_map(&map(&[("USDC_MINT", MINT)])).unwrap_err(),
+            ConfigError::Missing("MM_ALLOWLIST")
+        );
+        assert!(Config::from_map(&map(&[("USDC_MINT", "x"), ("MM_ALLOWLIST", A)])).is_err());
+    }
+
+    #[test]
+    fn defaults_match_the_contract() {
+        let cfg = Config::from_map(&map(&[
+            ("USDC_MINT", MINT),
+            ("MM_ALLOWLIST", A),
+            ("ADMIN_TOKEN", ""),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.bind_addr, "127.0.0.1:8080");
+        assert_eq!(cfg.solana_rpc, "https://api.devnet.solana.com");
+        assert_eq!(cfg.program_id, DEFAULT_PROGRAM_ID);
+        assert_eq!(cfg.rfq_timeout, Duration::from_millis(1000));
+        assert_eq!(cfg.sign_timeout, Duration::from_millis(10_000));
+        assert_eq!(cfg.market_timeout, Duration::from_millis(2500));
+        assert_eq!(cfg.health_poll, Duration::from_millis(5000));
+        assert_eq!(cfg.board_cache_ttl, Duration::from_millis(5000));
+        assert_eq!(cfg.expiries_cache_ttl, Duration::from_millis(30_000));
+        assert!(cfg.broadcast);
+        assert!(cfg.faucet_keypair.is_none());
+        assert_eq!(cfg.faucet_amount_usdc, 1000.0);
+        assert_eq!(cfg.faucet_sol_airdrop, 0.5);
+        assert_eq!(cfg.faucet_cooldown, Duration::from_millis(3_600_000));
+        assert!(cfg.admin_token.is_none());
+        assert_eq!(cfg.ping_interval, Duration::from_secs(20));
+        assert_eq!(cfg.idle_timeout, Duration::from_secs(60));
+        assert_eq!(cfg.hello_timeout, Duration::from_secs(10));
+        assert_eq!(cfg.faucet_confirm_timeout, Duration::from_secs(30));
+        let rl = cfg.rate_limits;
+        assert_eq!(
+            (rl.window, rl.rfq, rl.sign, rl.faucet, rl.get),
+            (Duration::from_secs(60), 120, 30, 10, 600)
+        );
+    }
+
+    #[test]
+    fn overrides_parse() {
+        let cfg = Config::from_map(&map(&[
+            ("USDC_MINT", MINT),
+            ("MM_ALLOWLIST", &format!("alpha:{A}")),
+            ("BIND_ADDR", "0.0.0.0:9000"),
+            ("RFQ_TIMEOUT_MS", "250"),
+            ("BROADCAST", "false"),
+            ("FAUCET_KEYPAIR", "/keys/faucet.json"),
+            ("FAUCET_SOL_AIRDROP", "0.25"),
+            ("ADMIN_TOKEN", "t0ken"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.bind_addr, "0.0.0.0:9000");
+        assert_eq!(cfg.rfq_timeout, Duration::from_millis(250));
+        assert!(!cfg.broadcast);
+        assert_eq!(cfg.faucet_keypair, Some(PathBuf::from("/keys/faucet.json")));
+        assert_eq!(cfg.faucet_sol_airdrop, 0.25);
+        assert_eq!(cfg.admin_token.as_deref(), Some("t0ken"));
+    }
+
+    #[test]
+    fn rejects_bad_numbers() {
+        let base = [("USDC_MINT", MINT), ("MM_ALLOWLIST", A)];
+        for (k, v) in [
+            ("RFQ_TIMEOUT_MS", "abc"),
+            ("SIGN_TIMEOUT_MS", "0"),
+            ("BROADCAST", "maybe"),
+            ("FAUCET_ASSET_USD", "-1"),
+        ] {
+            let mut m = map(&base);
+            m.insert(k.to_string(), v.to_string());
+            assert!(Config::from_map(&m).is_err(), "{k}={v} should fail");
+        }
+    }
+}

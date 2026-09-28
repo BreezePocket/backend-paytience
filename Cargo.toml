@@ -1,0 +1,39 @@
+[package]
+name = "paytience-backend"
+version = "0.1.0"
+edition = "2024"
+description = "PAYtience quote aggregator: MM WebSockets, best-yield RFQ auction, merged market data, co-sign routing and broadcast"
+publish = false
+
+[[bin]]
+name = "paytience-backend"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8.9", features = ["ws"] }
+base64 = "0.23"
+bs58 = "0.5"
+dotenvy = "0.15"
+ed25519-dalek = "3.0"
+futures-util = "0.3"
+getrandom = "0.3"
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+solana-hash = "4.7"
+solana-instruction = "4.0"
+solana-keypair = "4.0"
+solana-message = "5.1"
+solana-pubkey = { version = "4.4", features = ["curve25519"] }
+solana-signer = "4.0"
+solana-transaction = { version = "5.1", features = ["wincode", "serde"] }
+thiserror = "2"
+tokio = { version = "1.53", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+wincode = "0.6"
+
+[dev-dependencies]
+tokio-tungstenite = "0.30"

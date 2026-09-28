@@ -1,0 +1,14 @@
+[Unit]
+Description=Cloudflare named tunnel: api.paytience.app -> PAYtience backend
+After=network-online.target paytience-backend.service
+Wants=network-online.target
+
+[Service]
+User=paytience
+Group=paytience
+ExecStart=/usr/local/bin/cloudflared tunnel --no-autoupdate --config /etc/cloudflared/paytience-api.yml run
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
