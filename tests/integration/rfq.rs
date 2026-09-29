@@ -34,8 +34,14 @@ async fn best_of_two_wins_and_echoes_client_rfq_id() {
     assert_eq!(body["yield_amount"], "2000");
     assert_eq!(body["mm_pubkey"], b.pubkey);
     assert_eq!(body["mm_name"], "bravo");
-    assert_eq!(body["quotes_received"], 2);
-    assert_eq!(body["mms_asked"], 2);
+    assert!(
+        body.get("quotes_received").is_none(),
+        "the MM count is not public"
+    );
+    assert!(
+        body.get("mms_asked").is_none(),
+        "the MM count is not public"
+    );
     assert_eq!(
         body["valid_until"], 1759000030000u64,
         "passed through unchanged"
@@ -105,8 +111,14 @@ async fn spoofed_mm_pubkey_is_discarded() {
     let (status, body) = server.rfq("web-s", "1").await;
     assert_eq!(status, 200);
     assert_eq!(body["quote_id"], "honest");
-    assert_eq!(body["quotes_received"], 1);
-    assert_eq!(body["mms_asked"], 2);
+    assert!(
+        body.get("quotes_received").is_none(),
+        "the MM count is not public"
+    );
+    assert!(
+        body.get("mms_asked").is_none(),
+        "the MM count is not public"
+    );
 }
 
 #[tokio::test]
@@ -183,8 +195,14 @@ async fn late_quote_after_the_window_is_ignored() {
     server.wait_eligible(2).await;
     let (_, body) = server.rfq("web-l", "1").await;
     assert_eq!(body["quote_id"], "fast");
-    assert_eq!(body["quotes_received"], 1);
-    assert_eq!(body["mms_asked"], 2);
+    assert!(
+        body.get("quotes_received").is_none(),
+        "the MM count is not public"
+    );
+    assert!(
+        body.get("mms_asked").is_none(),
+        "the MM count is not public"
+    );
 }
 
 #[tokio::test]
@@ -261,10 +279,7 @@ async fn live_mms_are_asked_and_dry_run_ones_are_not() {
         "the dry-run MM would never co-sign"
     );
     assert_eq!(body["yield_amount"], "1000");
-    assert_eq!(
-        (body["mms_asked"].clone(), body["quotes_received"].clone()),
-        (json!(1), json!(1))
-    );
+    assert!(body.get("mms_asked").is_none() && body.get("quotes_received").is_none());
     assert!(dry.received(Channel::Rfq, "rfq_request", None).is_empty());
     assert_eq!(server.app.registry.counters(&b.pubkey).rfqs_asked, 0);
 }
@@ -285,5 +300,8 @@ async fn dry_run_mms_are_asked_when_no_live_mm_is_online() {
     let (status, body) = server.rfq("web-dry", "8").await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["mm_pubkey"], b.pubkey);
-    assert_eq!(body["mms_asked"], 1);
+    assert!(
+        body.get("mms_asked").is_none(),
+        "the MM count is not public"
+    );
 }

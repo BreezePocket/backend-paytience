@@ -129,7 +129,6 @@ async fn health(State(app): State<Arc<App>>) -> Response {
             "service": SERVICE,
             "version": env!("CARGO_PKG_VERSION"),
             "mm_pubkey": mm_pubkey,
-            "mm_count": snaps.len(),
             "program_id": app.config.program_id,
             "usdc_mint": app.config.usdc_mint,
             "dry_run": merged.dry_run,

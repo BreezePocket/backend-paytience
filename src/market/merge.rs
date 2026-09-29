@@ -178,7 +178,6 @@ fn merge_asset(entries: &[&Value]) -> Value {
         "spot": opt_num(median(&numbers(priced.iter().copied(), "spot"))),
         "atm_vol": opt_num(median(&numbers(priced.iter().copied(), "atm_vol"))),
         "expiries": opt_num(max_of(&numbers(entries.iter().copied(), "expiries"))),
-        "mm_count": entries.len(),
     })
 }
 
@@ -367,7 +366,6 @@ pub fn merge_boards(boards: &[(&str, &Value)]) -> Option<Value> {
     out.insert("fee_pct".into(), fee_pct);
     out.insert("mm_pubkey".into(), json!(boards[best].0));
     out.insert("generated_at".into(), opt_num(generated_at));
-    out.insert("mm_count".into(), json!(boards.len()));
     out.insert("expiries".into(), Value::Array(merged_rows));
     Some(Value::Object(out))
 }
@@ -484,7 +482,10 @@ mod tests {
             })
         );
         assert_eq!(m.assets.len(), 1);
-        assert_eq!(m.assets[0]["mm_count"], json!(2));
+        assert!(
+            m.assets[0].get("mm_count").is_none(),
+            "the MM count is not public"
+        );
 
         let dry = merge_health(&[&b]);
         assert!(!dry.ok);
@@ -532,7 +533,10 @@ mod tests {
         assert_eq!(out[0]["spot"], json!(202));
         assert_eq!(out[0]["atm_vol"], json!(0.75));
         assert_eq!(out[0]["expiries"], json!(12));
-        assert_eq!(out[0]["mm_count"], json!(2));
+        assert!(
+            out[0].get("mm_count").is_none(),
+            "the MM count is not public"
+        );
 
         let tsla = &out[1];
         assert_eq!(tsla["tradable"], json!(true));
@@ -558,7 +562,7 @@ mod tests {
         assert_eq!(spy["spot"], json!(505), "no fresh entry: all entries");
         assert_eq!(spy["atm_vol"], json!(0.2), "median of non-null");
         assert_eq!(spy["expiries"], json!(3));
-        assert_eq!(spy["mm_count"], json!(2));
+        assert!(spy.get("mm_count").is_none(), "the MM count is not public");
     }
 
     #[test]
@@ -635,7 +639,7 @@ mod tests {
         assert_eq!(out["generated_at"], json!(3000));
         assert_eq!(out["fee_pct"], json!(0.25));
         assert_eq!(out["tradable"], json!(true));
-        assert_eq!(out["mm_count"], json!(3));
+        assert!(out.get("mm_count").is_none(), "the MM count is not public");
         assert_eq!(out["amount"], json!("1000000000"));
         assert_eq!(out["mm_pubkey"], json!("B"), "B contributes the most cells");
 

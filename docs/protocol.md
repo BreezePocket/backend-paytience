@@ -221,7 +221,6 @@ Same shape as the desk's `/health`, aggregated, plus backend fields:
   "service": "paytience-backend",
   "version": "0.1.0",
   "mm_pubkey": "<pubkey of an online MM, or \"\" when none>",
-  "mm_count": 2,
   "program_id": "<backend PROGRAM_ID>",
   "usdc_mint": "<backend USDC_MINT>",
   "dry_run": false,
@@ -238,7 +237,6 @@ Same shape as the desk's `/health`, aggregated, plus backend fields:
 Aggregation over the **fresh, eligible** representatives (§2: live ones if any is
 fresh, else dry-run ones; one snapshot per pubkey):
 - `ok`: at least one such MM whose own `health.ok` is true.
-- `mm_count`: number of distinct MM pubkeys merged.
 - `mm_pubkey`: kept for older dashboards (their `resolveDesk` requires a string): the
   first merged MM, else any online MM, else `""`.
 - `dry_run`: true only when every fresh eligible MM reports `dry_run: true` (nothing
@@ -247,13 +245,14 @@ fresh, else dry-run ones; one snapshot per pubkey):
   `expiries` = max; `source` = `"aggregate"`.
 - `exposure`: `totalUsd`, `capTotalUsd`, `capPerExpiryUsd` are sums;
   `perExpiry[ts].onChainUsd` / `.reservedUsd` are sums per key.
-- When no MM is fresh: `ok: false`, `mm_count: 0`, `price: { "source": "aggregate", "spot": null, … }`,
+- When no MM is fresh: `ok: false`, `price: { "source": "aggregate", "spot": null, … }`,
   `assets: []`, `exposure` all zero with `perExpiry: {}`.
 
 The status is always **200**, online or not; `ok` carries the verdict.
 
-MM identities beyond `mm_pubkey` are **not** listed publicly (spec: don't expose MM
-identity); see `GET /admin/mms`.
+**How many** market makers are connected is never exposed publicly: no public response
+carries a count of MMs, instances or quotes, and MM identities beyond `mm_pubkey` are
+not listed either (spec: don't expose MM identity). Operators use `GET /admin/mms`.
 
 ### 2.2 `GET /assets`
 
@@ -270,7 +269,6 @@ MMs by case-insensitive `asset`:
 | `fresh` | any MM's entry is fresh |
 | `spot`, `atm_vol` | median of non-null values from fresh entries (all entries if none fresh) |
 | `expiries` | max of non-null |
-| `mm_count` | (new) number of MMs pricing it |
 
 Order: SOL first, then first-seen order.
 
@@ -301,7 +299,6 @@ to the same representatives as §2.4 (timeout 2.5 s each) and merges:
   `tradable` (OR across boards), `mint`, `decimals`, `product`, `token`, `yield_token`,
   `amount`. `index_price` = median. `generated_at` = max. `fee_pct` = min across
   contributing MMs. `mm_pubkey` = the MM contributing the most cells (ties: first).
-  New: `mm_count` = number of boards merged.
 - `expiries`: rows merged by `expiry_ts` (`days` first seen, `forward_price` median,
   `atm_vol` median of non-null). Cells merged by `fixed_price` (exact equality); for
   each strike keep the cell with the largest `yield_amount` (u64 compare), ties by
@@ -333,8 +330,8 @@ Auction:
    `RFQ_TIMEOUT_MS` (default 1000) elapses.
 3. Winner = largest `yield_amount` among valid responses; ties → earliest received.
 4. Response **200**: the winner's `rfq_response` with `rfq_id` replaced by the client's,
-   plus `mm_name` (allowlist name), `quotes_received` (valid quotes), `mms_asked`
-   (size of the asked set).
+   plus `mm_name` (allowlist name). How many MMs were asked or quoted is not returned
+   (§2.1: no public MM count).
 5. No quotes but ≥1 decline → **200** `rfq_decline` with `reason`: the single distinct
    reason, or `"no market maker quoted: <r1>; <r2>"` (distinct, in arrival order).
 6. No valid quote and no decline → **504** `rfq_decline` "no market maker responded

@@ -65,7 +65,7 @@ raw desk. Every response carries `access-control-allow-origin: *`. Errors are
 
 | Method and path | What it does | Contract |
 |---|---|---|
-| `GET /health` | Aggregated desk health, plus `mm_count`, `service`, `version` and `stats` | §2.1 |
+| `GET /health` | Aggregated desk health, plus `service`, `version` and `stats` (never how many market makers are connected; see `/admin/mms`) | §2.1 |
 | `GET /assets` | Assets merged across fresh MMs | §2.2 |
 | `GET /price?asset=` | One MM's price snapshot, from the freshest MM | §2.3 |
 | `GET /expiries?asset=` | Expiries merged across MMs (cached 30 s) | §2.4 |

@@ -330,8 +330,6 @@ pub async fn run(app: &App, rfq: &ValidRfq) -> (u16, Value) {
             obj.insert("rfq_id".into(), json!(rfq.rfq_id));
             obj.insert("yield_amount".into(), json!(yield_amount.to_string()));
             obj.insert("mm_name".into(), json!(t.name));
-            obj.insert("quotes_received".into(), json!(yields.len()));
-            obj.insert("mms_asked".into(), json!(targets.len()));
         }
         Stats::inc(&app.stats.quoted);
         return (200, frame);

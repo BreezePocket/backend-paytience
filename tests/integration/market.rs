@@ -53,7 +53,7 @@ async fn health_aggregates_two_mms() {
     assert_eq!(h["ok"], true);
     assert_eq!(h["service"], "paytience-backend");
     assert_eq!(h["version"], "0.1.0");
-    assert_eq!(h["mm_count"], 2);
+    assert!(h.get("mm_count").is_none(), "the MM count is not public");
     assert_eq!(h["mm_pubkey"], a.pubkey);
     assert_eq!(h["program_id"], PROGRAM_ID);
     assert_eq!(h["usdc_mint"], usdc_mint());
@@ -68,7 +68,10 @@ async fn health_aggregates_two_mms() {
         h["exposure"]["perExpiry"]["1759824000"],
         json!({ "onChainUsd": 1234.5, "reservedUsd": 0 })
     );
-    assert_eq!(h["assets"][0]["mm_count"], 2);
+    assert!(
+        h["assets"][0].get("mm_count").is_none(),
+        "the MM count is not public"
+    );
     assert_eq!(h["assets"][0]["spot"], 202);
     let stats = h["stats"].as_object().unwrap();
     for k in [
@@ -91,7 +94,7 @@ async fn health_offline_shape() {
     let (status, h) = server.get("/health").await;
     assert_eq!(status, 200);
     assert_eq!(h["ok"], false);
-    assert_eq!(h["mm_count"], 0);
+    assert!(h.get("mm_count").is_none(), "the MM count is not public");
     assert_eq!(h["mm_pubkey"], "");
     assert_eq!(h["price"]["spot"], Value::Null);
     assert_eq!(h["assets"], json!([]));
@@ -116,7 +119,7 @@ async fn two_instances_of_one_mm_count_once() {
     server.wait_eligible(2).await;
     server.wait_fresh(1).await;
     let (_, h) = server.get("/health").await;
-    assert_eq!(h["mm_count"], 1);
+    assert!(h.get("mm_count").is_none(), "the MM count is not public");
     assert_eq!(h["exposure"]["totalUsd"], 1000, "not double counted");
 }
 
@@ -139,7 +142,10 @@ async fn assets_are_merged() {
     assert_eq!(assets.len(), 1);
     assert_eq!(assets[0]["asset"], "SOL");
     assert_eq!(assets[0]["spot"], 205);
-    assert_eq!(assets[0]["mm_count"], 2);
+    assert!(
+        assets[0].get("mm_count").is_none(),
+        "the MM count is not public"
+    );
     assert_eq!(assets[0]["tradable"], true);
 }
 
@@ -175,7 +181,10 @@ async fn board_is_merged_through_rest() {
         .get("/board?asset=SOL&moneyness=1.05,abc,1.1&max_days=30&exact=false")
         .await;
     assert_eq!(status, 200, "{board}");
-    assert_eq!(board["mm_count"], 2);
+    assert!(
+        board.get("mm_count").is_none(),
+        "the MM count is not public"
+    );
     assert_eq!(board["index_price"], 202);
     assert_eq!(board["fee_pct"], 0.25);
     assert_eq!(board["mm_pubkey"], b.pubkey, "B wins 2 of 3 cells");
@@ -310,7 +319,7 @@ async fn board_one_success_is_enough() {
     server.wait_eligible(2).await;
     let (status, body) = server.get("/board").await;
     assert_eq!(status, 200);
-    assert_eq!(body["mm_count"], 1);
+    assert!(body.get("mm_count").is_none(), "the MM count is not public");
 }
 
 #[tokio::test]
@@ -480,7 +489,10 @@ async fn market_data_prefers_live_mms_over_dry_run_ones() {
 
     let (status, board) = server.get("/board").await;
     assert_eq!(status, 200, "{board}");
-    assert_eq!(board["mm_count"], 1);
+    assert!(
+        board.get("mm_count").is_none(),
+        "the MM count is not public"
+    );
     assert_eq!(board["index_price"], 200);
     let quotes = board["expiries"][0]["quotes"].as_array().unwrap();
     assert_eq!(quotes.len(), 1);
@@ -493,14 +505,15 @@ async fn market_data_prefers_live_mms_over_dry_run_ones() {
 
     let (status, h) = server.get("/health").await;
     assert_eq!(status, 200);
-    assert_eq!(
-        (h["mm_count"].clone(), h["dry_run"].clone()),
-        (json!(1), json!(false))
-    );
+    assert_eq!(h["dry_run"], json!(false));
+    assert!(h.get("mm_count").is_none(), "the MM count is not public");
     assert_eq!(h["mm_pubkey"], a.pubkey);
     assert_eq!(h["price"]["spot"], 200);
     let (_, assets) = server.get("/assets").await;
-    assert_eq!(assets["assets"][0]["mm_count"], 1);
+    assert!(
+        assets["assets"][0].get("mm_count").is_none(),
+        "the MM count is not public"
+    );
     assert_eq!(assets["assets"][0]["spot"], 200);
 }
 
@@ -520,12 +533,13 @@ async fn dry_run_only_mms_still_serve_market_data() {
 
     let (status, board) = server.get("/board").await;
     assert_eq!(status, 200, "{board}");
-    assert_eq!(board["mm_count"], 1);
+    assert!(
+        board.get("mm_count").is_none(),
+        "the MM count is not public"
+    );
     assert_eq!(board["expiries"][0]["quotes"][0]["mm_pubkey"], b.pubkey);
     let (_, h) = server.get("/health").await;
-    assert_eq!(
-        (h["mm_count"].clone(), h["dry_run"].clone()),
-        (json!(1), json!(true))
-    );
+    assert_eq!(h["dry_run"], json!(true));
+    assert!(h.get("mm_count").is_none(), "the MM count is not public");
     assert_eq!(h["price"]["spot"], 300);
 }
