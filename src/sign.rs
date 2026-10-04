@@ -1,5 +1,6 @@
 //! `POST /sign` (contract §2.7): route a user-signed transaction to the MM that pays
 //! its fee, wait for the co-signature, and broadcast it unless the desk already did.
+//! A co-signed position is reserved against the MM's caps until a scan sees it (§5.6).
 
 use std::sync::Arc;
 
@@ -91,6 +92,16 @@ pub async fn run(app: &App, body: &Value) -> (u16, Value) {
                 return reject(422, "market maker returned no transaction".into());
             };
             app.registry.count(&mm, |c| c.signs += 1);
+            // §5.6: the MM is now committed to this position; count it until a scan
+            // shows it on chain (or 2 minutes pass).
+            let (asset, notional) = app.exposure.size(
+                parsed.asset_mint.as_deref(),
+                parsed.product,
+                parsed.amount,
+                parsed.fixed_price,
+            );
+            app.exposure
+                .reserve(&parsed.fee_payer, parsed.nonce, &asset, notional);
             let desk_signature = reply
                 .get("signature")
                 .and_then(Value::as_str)
@@ -104,6 +115,8 @@ pub async fn run(app: &App, body: &Value) -> (u16, Value) {
                         Some(sig)
                     }
                     Err(RpcError::Rpc { message, .. }) => {
+                        // The node refused it: the position will not exist.
+                        app.exposure.release(&parsed.fee_payer, parsed.nonce);
                         Stats::inc(&app.stats.sign_rejections);
                         return reject(422, format!("broadcast failed: {message}"));
                     }

@@ -15,6 +15,8 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
+# The market-maker registry (MM_REGISTRY_PATH) is the only thing the backend writes.
+ReadWritePaths=/opt/paytience/data
 
 [Install]
 WantedBy=multi-user.target

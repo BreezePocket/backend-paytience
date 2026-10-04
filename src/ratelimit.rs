@@ -34,7 +34,8 @@ impl RouteClass {
             (_, "/ws/rfq" | "/ws/sign") => Some(Self::Ws),
             (&Method::POST, "/rfq") => Some(Self::Rfq),
             (&Method::POST, "/sign") => Some(Self::Sign),
-            (&Method::POST, "/faucet") => Some(Self::Faucet),
+            // §5.2: applications share the faucet's budget.
+            (&Method::POST, "/faucet" | "/mm/apply") => Some(Self::Faucet),
             (&Method::GET | &Method::HEAD, _) => Some(Self::Get),
             _ => None,
         }

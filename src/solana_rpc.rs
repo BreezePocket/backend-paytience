@@ -8,6 +8,8 @@
 
 use std::time::Duration;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as B64;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -129,6 +131,37 @@ impl SolanaRpc {
         Ok(r.value.into_iter().next().flatten())
     }
 
+    /// `getProgramAccounts` at `confirmed` with base64 data: every account of
+    /// `program_id` matching all `filters`. Many public RPCs refuse this method, which
+    /// is why the usage scan has its own URL (`SOLANA_SCAN_RPC`).
+    pub async fn get_program_accounts(
+        &self,
+        program_id: &str,
+        filters: &[Memcmp],
+    ) -> Result<Vec<ProgramAccount>, RpcError> {
+        let filters: Vec<Value> = filters
+            .iter()
+            .map(|f| json!({ "memcmp": { "offset": f.offset, "bytes": f.bytes } }))
+            .collect();
+        let raw: Vec<RawProgramAccount> = self
+            .call(
+                "getProgramAccounts",
+                json!([program_id, { "encoding": "base64", "commitment": "confirmed", "filters": filters }]),
+            )
+            .await?;
+        raw.into_iter()
+            .map(|a| {
+                let data = B64.decode(&a.account.data.0).map_err(|_| {
+                    RpcError::InvalidResponse(format!("account {} data is not base64", a.pubkey))
+                })?;
+                Ok(ProgramAccount {
+                    pubkey: a.pubkey,
+                    data,
+                })
+            })
+            .collect()
+    }
+
     /// `requestAirdrop` of `lamports` to `pubkey`; returns the signature.
     pub async fn request_airdrop(&self, pubkey: &str, lamports: u64) -> Result<String, RpcError> {
         self.call("requestAirdrop", json!([pubkey, lamports])).await
@@ -166,6 +199,33 @@ struct WithContext<T> {
 #[derive(Debug, Deserialize)]
 struct LatestBlockhash {
     blockhash: String,
+}
+
+/// A `getProgramAccounts` filter: the account's bytes at `offset` equal `bytes`
+/// (base58, the method's default encoding).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Memcmp {
+    pub offset: usize,
+    pub bytes: String,
+}
+
+/// One account returned by `getProgramAccounts`, its data decoded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProgramAccount {
+    pub pubkey: String,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawProgramAccount {
+    pubkey: String,
+    account: RawAccount,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawAccount {
+    /// `[<base64>, "base64"]`.
+    data: (String, String),
 }
 
 /// One entry of `getSignatureStatuses.value`.

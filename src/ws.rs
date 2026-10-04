@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::auth::{self, AuthError, CLOSE_BAD_HELLO, CLOSE_REPLACED, Expected};
+use crate::auth::{self, AuthError, CLOSE_BAD_HELLO, CLOSE_NOT_APPROVED, CLOSE_REPLACED, Expected};
 use crate::conn::{Conn, ConnInfo, Outbound};
 use crate::http::json_response;
 use crate::market::health_poller;
@@ -113,7 +113,7 @@ async fn handle_socket(
     let expected = Expected {
         channel,
         challenge: &challenge,
-        allowlist: &app.config.allowlist,
+        mms: &app.mms,
         program_id: &app.config.program_id,
         usdc_mint: &app.config.usdc_mint,
     };
@@ -165,6 +165,13 @@ async fn handle_socket(
     if let Some(old) = app.registry.register(conn.clone()) {
         tracing::info!(mm = %conn.name, channel = channel.as_str(), "replacing connection");
         old.close(CLOSE_REPLACED, "replaced");
+    }
+    // An admin may have rejected, suspended or deleted this MM between the hello check
+    // and the registration above, after its other sockets were closed (§5.4).
+    if app.mms.approved_name(&conn.mm_pubkey).is_none() {
+        app.registry.unregister(&conn);
+        conn.close(CLOSE_NOT_APPROVED, "no longer approved");
+        return finish(writer).await;
     }
     tracing::info!(mm = %conn.name, instance = %conn.instance_id, channel = channel.as_str(), "market maker connected");
     if channel == Channel::Rfq {

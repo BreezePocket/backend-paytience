@@ -1,0 +1,11 @@
+{
+  "generated_by": "tests/fixtures/gen-mm-apply.mjs using MM-system-breezepocket/src/protocol.js signApplication (node:crypto ed25519, seed 0x01 x 32)",
+  "seed_byte": 1,
+  "pubkey": "AKnL4NNf3DGWZJS6cPknBuEGnVsV4A4m5tgebLHaRSZ9",
+  "timestamp_ms": 1759000000000,
+  "message": "paytience-mm-apply:v1:{\"mm_pubkey\":\"AKnL4NNf3DGWZJS6cPknBuEGnVsV4A4m5tgebLHaRSZ9\",\"name\":\"Acme MM\",\"contact\":\"ops@acme.example\",\"cap_total_usd\":20000,\"asset_caps_usd\":{\"SOL\":10000,\"WBTC\":5000},\"timestamp_ms\":1759000000000}",
+  "body": {
+    "application": "{\"mm_pubkey\":\"AKnL4NNf3DGWZJS6cPknBuEGnVsV4A4m5tgebLHaRSZ9\",\"name\":\"Acme MM\",\"contact\":\"ops@acme.example\",\"cap_total_usd\":20000,\"asset_caps_usd\":{\"SOL\":10000,\"WBTC\":5000},\"timestamp_ms\":1759000000000}",
+    "signature": "lkWM1ofmBKFo5Z3ftgvbeLYKrUpm7nSI/Ip8GsHjQHpQFCTK+EcjpBkiMwTFeUXiCCY8fPJXMS64kxwycLDYBQ=="
+  }
+}

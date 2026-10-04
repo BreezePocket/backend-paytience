@@ -5,9 +5,11 @@ mod harness;
 
 mod admin;
 mod auth;
+mod caps;
 mod faucet;
 mod http;
 mod market;
 mod ratelimit;
+mod registration;
 mod rfq;
 mod sign;

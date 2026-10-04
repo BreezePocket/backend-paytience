@@ -2,3 +2,4 @@ target/
 .env
 keys/
 *.log
+data/

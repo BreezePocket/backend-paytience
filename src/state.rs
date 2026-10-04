@@ -6,8 +6,10 @@ use crate::auction::WinnerMemory;
 use anyhow::Context;
 
 use crate::config::Config;
+use crate::exposure::Exposure;
 use crate::faucet::{Faucet, load_keypair};
 use crate::market::Coalescer;
+use crate::mmreg::MmRegistry;
 use crate::preauth::PreauthGate;
 use crate::ratelimit::RateLimiter;
 use crate::registry::Registry;
@@ -16,7 +18,14 @@ use crate::stats::Stats;
 
 pub struct App {
     pub config: Config,
+    /// Live connections.
     pub registry: Registry,
+    /// §5: registrations and caps (who may connect, and how much each may carry).
+    pub mms: MmRegistry,
+    /// §5.6: each approved MM's usage, on chain and reserved.
+    pub exposure: Exposure,
+    /// `SOLANA_SCAN_RPC`: the `getProgramAccounts` client of the usage scan.
+    pub scan_rpc: SolanaRpc,
     pub stats: Stats,
     pub winners: WinnerMemory,
     pub rpc: SolanaRpc,
@@ -32,6 +41,16 @@ pub struct App {
 impl App {
     pub fn new(config: Config) -> anyhow::Result<Arc<Self>> {
         let rpc = SolanaRpc::new(&config.solana_rpc, config.rpc_timeout)?;
+        let scan_rpc = SolanaRpc::new(config.scan_rpc_url(), config.rpc_timeout)?;
+        let mms = match &config.mm_registry_path {
+            Some(path) => MmRegistry::load(path)
+                .map_err(anyhow::Error::msg)
+                .context("MM_REGISTRY_PATH")?,
+            None => MmRegistry::in_memory(Vec::new()),
+        };
+        mms.seed(&config.seed_mms)
+            .map_err(|e| anyhow::Error::msg(e.to_string()))
+            .context("MM_REGISTRY_PATH")?;
         let faucet = match &config.faucet_keypair {
             None => None,
             Some(path) => {
@@ -51,6 +70,9 @@ impl App {
         };
         Ok(Arc::new(Self {
             registry: Registry::new(),
+            mms,
+            exposure: Exposure::new(config.exposure_scan),
+            scan_rpc,
             stats: Stats::default(),
             winners: WinnerMemory::new(),
             rpc,

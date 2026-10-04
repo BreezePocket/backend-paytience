@@ -1,4 +1,5 @@
-//! The best-yield quote auction behind `POST /rfq` (contract §2.6, §1.4).
+//! The best-yield quote auction behind `POST /rfq` (contract §2.6, §1.4), among the
+//! market makers whose approved caps still have room for the RFQ (§5.7).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -10,8 +11,9 @@ use serde_json::{Map, Value, json};
 
 use crate::config::is_pubkey;
 use crate::conn::RequestError;
+use crate::exposure::{self, Product, Verdict, asset_symbol, notional_usd};
 use crate::protocol::{id_string, new_id, parse_u64, rfq_decline};
-use crate::registry::prefer_live;
+use crate::registry::{EligibleInstance, prefer_live};
 use crate::state::App;
 use crate::stats::Stats;
 
@@ -257,15 +259,105 @@ impl WinnerMemory {
     }
 }
 
+/// §5.7: who is asked. `Err` is the reason nobody may be.
+#[derive(Debug, PartialEq, Eq)]
+enum NobodyAsked {
+    /// No online MM has an approved cap for the asset.
+    NoQuoter,
+    /// At least one MM was excluded by its asset or total cap.
+    CapacityReached,
+}
+
+/// The MMs permitted for `symbol` (live ones preferred, §2.6) whose caps still fit
+/// `notional` on top of their usage.
+fn select_targets(
+    app: &App,
+    online: Vec<EligibleInstance>,
+    symbol: &str,
+    notional: f64,
+) -> Result<Vec<EligibleInstance>, NobodyAsked> {
+    let mut caps = HashMap::new();
+    for inst in &online {
+        if !caps.contains_key(&inst.mm_pubkey)
+            && let Some(c) = app.mms.approved_caps(&inst.mm_pubkey)
+        {
+            caps.insert(inst.mm_pubkey.clone(), c);
+        }
+    }
+    let permitted: Vec<EligibleInstance> = online
+        .into_iter()
+        .filter(|i| {
+            caps.get(&i.mm_pubkey)
+                .is_some_and(|c| c.asset_cap(symbol).is_some())
+        })
+        .collect();
+    // Dry-run MMs quote but never co-sign: ask them only when no live MM is permitted.
+    let candidates = prefer_live(permitted, app.config.health_fresh);
+    let mut verdicts: HashMap<String, Verdict> = HashMap::new();
+    let mut capped = false;
+    let mut targets = Vec::new();
+    for inst in candidates {
+        let verdict = match verdicts.get(&inst.mm_pubkey) {
+            Some(v) => *v,
+            None => {
+                let v = match caps.get(&inst.mm_pubkey) {
+                    Some(c) => {
+                        exposure::check(c, &app.exposure.usage(&inst.mm_pubkey), symbol, notional)
+                    }
+                    None => Verdict::NoCap,
+                };
+                if v != Verdict::Ask {
+                    tracing::debug!(mm = %inst.name, asset = symbol, notional, "not asked: {v:?}");
+                }
+                verdicts.insert(inst.mm_pubkey.clone(), v);
+                v
+            }
+        };
+        capped |= verdict.is_cap();
+        if verdict == Verdict::Ask {
+            targets.push(inst);
+        }
+    }
+    if !targets.is_empty() {
+        Ok(targets)
+    } else if capped {
+        Err(NobodyAsked::CapacityReached)
+    } else {
+        Err(NobodyAsked::NoQuoter)
+    }
+}
+
 /// Runs the auction; returns the HTTP status and typed body.
 pub async fn run(app: &App, rfq: &ValidRfq) -> (u16, Value) {
     Stats::inc(&app.stats.rfqs);
-    // Dry-run MMs quote but never co-sign: ask them only when no live MM is eligible.
-    let targets = prefer_live(app.registry.eligible(), app.config.health_fresh);
-    if targets.is_empty() {
+    let decline = |status: u16, reason: String| {
         Stats::inc(&app.stats.declined);
-        return (503, rfq_decline(&rfq.rfq_id, "no market maker is online"));
+        (status, rfq_decline(&rfq.rfq_id, reason))
+    };
+    let online = app.registry.eligible();
+    if online.is_empty() {
+        return decline(503, "no market maker is online".into());
     }
+    // §5.7: size the RFQ, then ask only the MMs whose caps have room for it.
+    let symbol = asset_symbol(rfq.asset.as_deref());
+    let sized = app
+        .exposure
+        .decimals_of(&symbol)
+        .zip(Product::from_name(&rfq.product));
+    let Some((decimals, product)) = sized else {
+        let asset = rfq.asset.as_deref().unwrap_or(exposure::SOL);
+        return decline(200, format!("{asset} is not listed on chain"));
+    };
+    let notional = notional_usd(product, rfq.amount, rfq.fixed_price, decimals);
+    let targets = match select_targets(app, online, &symbol, notional) {
+        Ok(t) => t,
+        Err(NobodyAsked::CapacityReached) => {
+            return decline(200, format!("market-maker capacity reached for {symbol}"));
+        }
+        Err(NobodyAsked::NoQuoter) => {
+            return decline(200, format!("no market maker quotes {symbol}"));
+        }
+    };
     let backend_id = new_id("agg");
     let frame = rfq.mm_frame(&backend_id);
     let timeout = app.config.rfq_timeout;
@@ -280,7 +372,7 @@ pub async fn run(app: &App, rfq: &ValidRfq) -> (u16, Value) {
         .collect();
 
     // Arrival order: every future is bounded by the same timeout.
-    let mut quotes: Vec<(&crate::registry::EligibleInstance, Value, u64)> = Vec::new();
+    let mut quotes: Vec<(&EligibleInstance, Value, u64)> = Vec::new();
     let mut declines: Vec<String> = Vec::new();
     while let Some((t, result)) = pending.next().await {
         let answer = match result {

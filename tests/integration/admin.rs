@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 
 use crate::harness::*;
 
-const TOKEN: &str = "s3cret-admin-token";
+const TOKEN: &str = ADMIN_TOKEN;
 
 async fn admin(server: &TestServer, auth: Option<&str>) -> (u16, Value) {
     let mut req = server.http.get(server.url("/admin/mms"));
@@ -80,8 +80,16 @@ async fn lists_instances_and_counters() {
 
     let alpha = &mms[0];
     assert_eq!(
-        (&alpha["pubkey"], &alpha["name"]),
-        (&json!(a.pubkey), &json!("alpha"))
+        (&alpha["mm_pubkey"], &alpha["name"], &alpha["status"]),
+        (&json!(a.pubkey), &json!("alpha"), &json!("approved"))
+    );
+    assert_eq!(alpha["approved"]["cap_total_usd"], 20000);
+    assert_eq!(alpha["approved"]["asset_caps_usd"]["SOL"], 20000);
+    assert_eq!(alpha["requested"], alpha["approved"]);
+    // The co-signed 0.5 SOL at 250 USDC is reserved until a scan sees it (§5.6).
+    assert_eq!(
+        alpha["usage"],
+        json!({ "known": true, "total_usd": 125, "by_asset_usd": { "SOL": 125 }, "reserved_usd": 125 })
     );
     let inst = &alpha["instances"].as_array().unwrap()[0];
     assert_eq!(inst["instance_id"], "i1");

@@ -26,13 +26,25 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(
         program_id = %config.program_id,
         usdc_mint = %config.usdc_mint,
-        mms = config.allowlist.entries().len(),
-        // Host only: the path or query of SOLANA_RPC may hold an API key.
+        // Host only: the path or query of an RPC URL may hold an API key.
         rpc_host = host_of(&config.solana_rpc),
+        scan_rpc_host = host_of(config.scan_rpc_url()),
+        mm_registry = ?config.mm_registry_path,
         broadcast = config.broadcast,
         "starting paytience-backend"
     );
+    let admin = config.admin_token.is_some();
     let app = App::new(config)?;
+    tracing::info!(
+        registered = app.mms.list().len(),
+        approved = app.mms.approved_count(),
+        "market-maker registry loaded"
+    );
+    if !admin {
+        tracing::warn!(
+            "ADMIN_TOKEN is unset: nobody can be approved, so no market maker can connect"
+        );
+    }
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("binding {addr}"))?;

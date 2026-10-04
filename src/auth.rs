@@ -1,17 +1,20 @@
-//! `hello` verification (contract §1.2), in the contract's order: version, channel,
-//! allowlist, signature, then program id and mint. Each failure carries its close code.
+//! `hello` verification (contract §1.2, §5.5), in the contract's order: version,
+//! channel, registration (status `approved`), signature, then program id and mint.
+//! Each failure carries its close code.
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde_json::Value;
 
-use crate::config::Allowlist;
+use crate::mmreg::MmRegistry;
 use crate::protocol::{Channel, auth_message};
 
 /// Bad hello, signature, version or channel; also the hello timeout.
 pub const CLOSE_BAD_HELLO: u16 = 4001;
-pub const CLOSE_NOT_ALLOWLISTED: u16 = 4003;
+/// No approved registration (§5.5); also closes the sockets of an MM that an admin
+/// rejected, suspended or deleted (§5.4).
+pub const CLOSE_NOT_APPROVED: u16 = 4003;
 pub const CLOSE_MISMATCH: u16 = 4009;
 pub const CLOSE_REPLACED: u16 = 4000;
 
@@ -32,7 +35,7 @@ fn fail(code: u16, reason: impl Into<String>) -> AuthError {
 pub struct Expected<'a> {
     pub channel: Channel,
     pub challenge: &'a str,
-    pub allowlist: &'a Allowlist,
+    pub mms: &'a MmRegistry,
     pub program_id: &'a str,
     pub usdc_mint: &'a str,
 }
@@ -62,10 +65,10 @@ pub fn verify_hello(hello: &Value, expected: &Expected<'_>) -> Result<Authentica
     let Some(mm_pubkey) = field("mm_pubkey") else {
         return Err(fail(CLOSE_BAD_HELLO, "bad hello: mm_pubkey is required"));
     };
-    let Some(name) = expected.allowlist.name_of(mm_pubkey) else {
+    let Some(name) = expected.mms.approved_name(mm_pubkey) else {
         return Err(fail(
-            CLOSE_NOT_ALLOWLISTED,
-            format!("{mm_pubkey} is not allowlisted"),
+            CLOSE_NOT_APPROVED,
+            format!("{mm_pubkey} is not an approved market maker"),
         ));
     };
     let instance_id = match field("instance_id") {
@@ -95,7 +98,7 @@ pub fn verify_hello(hello: &Value, expected: &Expected<'_>) -> Result<Authentica
     Ok(Authenticated {
         mm_pubkey: mm_pubkey.to_string(),
         instance_id: instance_id.to_string(),
-        name: name.to_string(),
+        name,
     })
 }
 
@@ -123,7 +126,7 @@ pub fn signature_valid(pubkey: &str, signature_b64: &str, message: &[u8]) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::AllowlistEntry;
+    use crate::mmreg::{Caps, MmRecord};
     use ed25519_dalek::{Signer, SigningKey};
     use serde_json::json;
 
@@ -141,11 +144,12 @@ mod tests {
         bs58::encode(k.verifying_key().as_bytes()).into_string()
     }
 
-    fn allowlist(k: &SigningKey) -> Allowlist {
-        Allowlist::from_entries(vec![AllowlistEntry {
-            name: "alpha".into(),
-            pubkey: pubkey(k),
-        }])
+    fn allowlist(k: &SigningKey) -> MmRegistry {
+        MmRegistry::in_memory(vec![MmRecord::approved(
+            pubkey(k),
+            "alpha",
+            Caps::new(1000.0, &[("SOL", 1000.0)]),
+        )])
     }
 
     fn hello(k: &SigningKey, channel: &str, signed_channel: Channel) -> Value {
@@ -157,13 +161,13 @@ mod tests {
         })
     }
 
-    fn check(h: &Value, list: &Allowlist, channel: Channel) -> Result<Authenticated, AuthError> {
+    fn check(h: &Value, list: &MmRegistry, channel: Channel) -> Result<Authenticated, AuthError> {
         verify_hello(
             h,
             &Expected {
                 channel,
                 challenge: CHALLENGE,
-                allowlist: list,
+                mms: list,
                 program_id: PROGRAM,
                 usdc_mint: MINT,
             },
@@ -208,12 +212,12 @@ mod tests {
         let h = hello(&k, "ws/rfq", Channel::Rfq);
         assert_eq!(code(&h, Channel::Sign), CLOSE_BAD_HELLO);
 
-        // Not allowlisted beats a bad signature and a mint mismatch.
+        // Not registered beats a bad signature and a mint mismatch.
         let other = SigningKey::from_bytes(&[9u8; 32]);
         let mut h = hello(&other, "ws/rfq", Channel::Rfq);
         h["signature"] = json!("AAAA");
         h["usdc_mint"] = json!("x");
-        assert_eq!(code(&h, Channel::Rfq), CLOSE_NOT_ALLOWLISTED);
+        assert_eq!(code(&h, Channel::Rfq), CLOSE_NOT_APPROVED);
 
         // Bad signature beats a mint mismatch.
         let mut h = hello(&k, "ws/rfq", Channel::Rfq);
@@ -238,6 +242,31 @@ mod tests {
         let mut h = hello(&k, "ws/rfq", Channel::Rfq);
         h.as_object_mut().unwrap().remove("signature");
         assert_eq!(code(&h, Channel::Rfq), CLOSE_BAD_HELLO);
+    }
+
+    #[test]
+    fn only_an_approved_registration_may_connect() {
+        let k = key();
+        let list = allowlist(&k);
+        let h = hello(&k, "ws/rfq", Channel::Rfq);
+        assert!(check(&h, &list, Channel::Rfq).is_ok());
+        list.suspend(&pubkey(&k), 1).unwrap();
+        assert_eq!(
+            check(&h, &list, Channel::Rfq).unwrap_err().code,
+            CLOSE_NOT_APPROVED
+        );
+        list.approve(&pubkey(&k), &json!({}), 2).unwrap();
+        assert!(check(&h, &list, Channel::Rfq).is_ok());
+        list.reject(&pubkey(&k), 3).unwrap();
+        assert_eq!(
+            check(&h, &list, Channel::Rfq).unwrap_err().code,
+            CLOSE_NOT_APPROVED
+        );
+        list.delete(&pubkey(&k)).unwrap();
+        assert_eq!(
+            check(&h, &list, Channel::Rfq).unwrap_err().code,
+            CLOSE_NOT_APPROVED
+        );
     }
 
     #[test]

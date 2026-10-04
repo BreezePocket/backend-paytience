@@ -62,8 +62,15 @@ async fn health_aggregates_two_mms() {
         h["price"],
         json!({ "source": "aggregate", "spot": 202, "spotAgeMs": 1000, "vol": 0.7, "expiries": 12 })
     );
-    assert_eq!(h["exposure"]["totalUsd"], 1234.5);
+    // §5.7: totals and caps are the backend's own view (no scan here: nothing on
+    // chain); the per-expiry figures stay the desks'.
+    assert_eq!(h["exposure"]["totalUsd"], 0);
     assert_eq!(h["exposure"]["capTotalUsd"], 40000);
+    assert_eq!(h["exposure"]["capPerExpiryUsd"], 10000);
+    assert_eq!(
+        h["exposure"]["perAsset"]["SOL"],
+        json!({ "usedUsd": 0, "capUsd": 40000 })
+    );
     assert_eq!(
         h["exposure"]["perExpiry"]["1759824000"],
         json!({ "onChainUsd": 1234.5, "reservedUsd": 0 })
@@ -100,7 +107,7 @@ async fn health_offline_shape() {
     assert_eq!(h["assets"], json!([]));
     assert_eq!(
         h["exposure"],
-        json!({ "totalUsd": 0, "capTotalUsd": 0, "capPerExpiryUsd": 0, "perExpiry": {} })
+        json!({ "totalUsd": 0, "capTotalUsd": 0, "capPerExpiryUsd": 0, "perExpiry": {}, "perAsset": {} })
     );
 }
 
@@ -120,7 +127,11 @@ async fn two_instances_of_one_mm_count_once() {
     server.wait_fresh(1).await;
     let (_, h) = server.get("/health").await;
     assert!(h.get("mm_count").is_none(), "the MM count is not public");
-    assert_eq!(h["exposure"]["totalUsd"], 1000, "not double counted");
+    assert_eq!(
+        h["exposure"]["perExpiry"]["1759824000"]["onChainUsd"], 1000,
+        "not double counted"
+    );
+    assert_eq!(h["exposure"]["capTotalUsd"], 20000, "one MM, one cap");
 }
 
 #[tokio::test]

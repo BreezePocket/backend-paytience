@@ -1,6 +1,7 @@
 //! Market data over `market_request` (contract §1.5, §2.1-2.5): the per-connection
 //! health poller, fan-out to MMs, TTL caches with request coalescing, and the query
-//! parsing that mirrors the desk's REST server.
+//! parsing that mirrors the desk's REST server. Market data for an asset comes only
+//! from MMs with an approved cap for it (§5.7).
 
 pub mod merge;
 
@@ -13,6 +14,7 @@ use serde_json::{Map, Value, json};
 use tokio::sync::OnceCell;
 
 use crate::conn::Conn;
+use crate::exposure::asset_symbol;
 use crate::protocol::{new_id, num};
 use crate::registry::{EligibleInstance, prefer_live, representatives};
 use crate::state::App;
@@ -345,10 +347,45 @@ fn asset_params(asset: Option<&str>) -> Value {
 // ---------------------------------------------------------------------------
 // Endpoint logic
 
+/// One representative per MM pubkey (§2) among the MMs with an approved cap for
+/// `asset` (§5.7; SOL when omitted). 503 when nobody is online, 404 when the online
+/// MMs do not quote the asset.
+fn permitted_representatives(
+    app: &App,
+    asset: Option<&str>,
+) -> Result<Vec<EligibleInstance>, MarketError> {
+    let online = app.registry.eligible();
+    if online.is_empty() {
+        return Err(MarketError::new(503, NO_MM_ONLINE));
+    }
+    let symbol = asset_symbol(asset);
+    let mut permits: HashMap<String, bool> = HashMap::new();
+    let permitted: Vec<EligibleInstance> = online
+        .into_iter()
+        .filter(|i| {
+            *permits.entry(i.mm_pubkey.clone()).or_insert_with(|| {
+                app.mms
+                    .approved_caps(&i.mm_pubkey)
+                    .is_some_and(|c| c.asset_cap(&symbol).is_some())
+            })
+        })
+        .collect();
+    if permitted.is_empty() {
+        return Err(MarketError::new(
+            404,
+            format!("no market maker quotes {symbol}"),
+        ));
+    }
+    Ok(representatives(prefer_live(
+        permitted,
+        app.config.health_fresh,
+    )))
+}
+
 /// `/price` (§2.3): one MM, the one with the freshest snapshot, returned verbatim.
 pub async fn price(app: &App, asset: Option<&str>) -> MarketResult {
     let fresh = app.config.health_fresh;
-    let reps = app.registry.market_representatives(fresh);
+    let reps = permitted_representatives(app, asset)?;
     let target = reps
         .iter()
         .filter_map(|r| r.fresh_health(fresh).map(|h| (r, h.at)))
@@ -376,10 +413,7 @@ pub async fn expiries(app: &App, asset: Option<&str>) -> MarketResult {
     let params = asset_params(asset);
     app.expiries_cache
         .get(&key, || async move {
-            let targets = app.registry.market_representatives(app.config.health_fresh);
-            if targets.is_empty() {
-                return Err(MarketError::new(503, NO_MM_ONLINE));
-            }
+            let targets = permitted_representatives(app, asset)?;
             let results = fan_out(&targets, "expiries", &params, app.config.market_timeout).await;
             let (lists, failures) = split_results(results, |v| {
                 v.get("expiries").and_then(Value::as_array).cloned()
@@ -400,10 +434,7 @@ pub async fn board(app: &App, query: &BoardQuery) -> MarketResult {
     let params = query.params();
     app.board_cache
         .get(&query.cache_key(), || async move {
-            let targets = app.registry.market_representatives(app.config.health_fresh);
-            if targets.is_empty() {
-                return Err(MarketError::new(503, NO_MM_ONLINE));
-            }
+            let targets = permitted_representatives(app, query.asset.as_deref())?;
             let results = fan_out(&targets, "board", &params, app.config.market_timeout).await;
             let mut boards: Vec<(&str, Value)> = Vec::new();
             let mut failures = Vec::new();
@@ -445,8 +476,23 @@ fn split_results<T>(
     (ok, failures)
 }
 
+/// Drops the `assets` entries an MM has no approved cap for (§5.7), so `/assets` and
+/// `/health.assets` merge only what each MM may quote.
+fn keep_permitted_assets(app: &App, mm_pubkey: &str, mut body: Value) -> Value {
+    let caps = app.mms.approved_caps(mm_pubkey);
+    if let Some(assets) = body.get_mut("assets").and_then(Value::as_array_mut) {
+        assets.retain(|entry| {
+            let symbol = asset_symbol(entry.get("asset").and_then(Value::as_str));
+            caps.as_ref()
+                .is_some_and(|c| c.asset_cap(&symbol).is_some())
+        });
+    }
+    body
+}
+
 /// Fresh health snapshots, one per MM pubkey (§2.1 "fresh, eligible"): the live MMs'
-/// if any is fresh, else the dry-run ones'.
+/// if any is fresh, else the dry-run ones'. Each lists only the assets its MM has an
+/// approved cap for.
 pub fn fresh_snapshots(app: &App) -> Vec<(String, Value)> {
     let fresh = app.config.health_fresh;
     let with_fresh: Vec<EligibleInstance> = app
@@ -458,8 +504,10 @@ pub fn fresh_snapshots(app: &App) -> Vec<(String, Value)> {
     representatives(prefer_live(with_fresh, fresh))
         .into_iter()
         .filter_map(|r| {
-            r.fresh_health(fresh)
-                .map(|h| (r.mm_pubkey.clone(), h.body.clone()))
+            r.fresh_health(fresh).map(|h| {
+                let body = keep_permitted_assets(app, &r.mm_pubkey, h.body.clone());
+                (r.mm_pubkey.clone(), body)
+            })
         })
         .collect()
 }

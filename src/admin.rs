@@ -1,11 +1,15 @@
-//! `GET /admin/mms` (contract §2.9): every allowlisted MM with its connected instances
-//! and per-pubkey counters, behind `Authorization: Bearer <ADMIN_TOKEN>`.
+//! The admin API (contract §2.9, §5.4), behind `Authorization: Bearer <ADMIN_TOKEN>`:
+//! `GET /admin/mms` lists every registration with its connected instances, counters
+//! and usage; approve / reject / suspend / delete change who may connect, at once.
 
 use std::hint::black_box;
 
 use axum::http::{HeaderMap, header};
 use serde_json::{Value, json};
 
+use crate::auth::CLOSE_NOT_APPROVED;
+use crate::mmreg::RegError;
+use crate::protocol::now_ms;
 use crate::state::App;
 
 /// Byte comparison whose time depends only on the length of `given`.
@@ -42,17 +46,16 @@ pub fn authorize(app: &App, headers: &HeaderMap) -> Auth {
     }
 }
 
-/// The listing: allowlist order, instances oldest first.
+/// The listing: records in creation order, instances oldest first.
 pub fn list_mms(app: &App) -> Value {
     let fresh = app.config.health_fresh;
     let mms: Vec<Value> = app
-        .config
-        .allowlist
-        .entries()
+        .mms
+        .list()
         .iter()
-        .map(|entry| {
+        .map(|record| {
             let mut instances: Vec<(u64, String, Value)> = app.registry.with_instances(|all| {
-                all.filter(|i| i.mm_pubkey == entry.pubkey)
+                all.filter(|i| i.mm_pubkey == record.mm_pubkey)
                     .map(|i| {
                         let health = i.health.as_ref();
                         let body = health.map(|h| &h.body);
@@ -77,23 +80,69 @@ pub fn list_mms(app: &App) -> Value {
                     .collect()
             });
             instances.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
-            let c = app.registry.counters(&entry.pubkey);
-            json!({
-                "pubkey": entry.pubkey,
-                "name": entry.name,
-                "instances": instances.into_iter().map(|(_, _, v)| v).collect::<Vec<_>>(),
-                "rfqs_asked": c.rfqs_asked,
-                "quotes": c.quotes,
-                "declines": c.declines,
-                "timeouts": c.timeouts,
-                "wins": c.wins,
-                "signs": c.signs,
-                "sign_rejections": c.sign_rejections,
-                "sign_timeouts": c.sign_timeouts,
-            })
+            let c = app.registry.counters(&record.mm_pubkey);
+            let mut out = record.to_json();
+            if let Some(obj) = out.as_object_mut() {
+                let instances = instances.into_iter().map(|(_, _, v)| v).collect::<Vec<_>>();
+                obj.insert("instances".into(), json!(instances));
+                for (key, n) in [
+                    ("rfqs_asked", c.rfqs_asked),
+                    ("quotes", c.quotes),
+                    ("declines", c.declines),
+                    ("timeouts", c.timeouts),
+                    ("wins", c.wins),
+                    ("signs", c.signs),
+                    ("sign_rejections", c.sign_rejections),
+                    ("sign_timeouts", c.sign_timeouts),
+                ] {
+                    obj.insert(key.into(), json!(n));
+                }
+                obj.insert(
+                    "usage".into(),
+                    app.exposure.usage(&record.mm_pubkey).to_json(),
+                );
+            }
+            out
         })
         .collect();
     json!({ "mms": mms })
+}
+
+/// Closes every live socket of an MM that may no longer connect (4003) and forgets
+/// its usage view.
+fn disconnect(app: &App, mm_pubkey: &str, reason: &str) {
+    let closed = app
+        .registry
+        .close_pubkey(mm_pubkey, CLOSE_NOT_APPROVED, reason);
+    app.exposure.forget(mm_pubkey);
+    tracing::info!(mm = %mm_pubkey, closed, "market maker {reason}");
+}
+
+/// §5.4: status `approved` with the given (else the requested) caps, and a usage scan
+/// right away so the MM is asked for quotes without waiting a full interval.
+pub fn approve(app: &App, mm_pubkey: &str, body: &Value) -> Result<Value, RegError> {
+    let record = app.mms.approve(mm_pubkey, body, now_ms())?;
+    tracing::info!(mm = %mm_pubkey, name = %record.name, "market maker approved");
+    app.exposure.trigger();
+    Ok(record.to_json())
+}
+
+pub fn reject(app: &App, mm_pubkey: &str) -> Result<Value, RegError> {
+    let record = app.mms.reject(mm_pubkey, now_ms())?;
+    disconnect(app, mm_pubkey, "rejected");
+    Ok(record.to_json())
+}
+
+pub fn suspend(app: &App, mm_pubkey: &str) -> Result<Value, RegError> {
+    let record = app.mms.suspend(mm_pubkey, now_ms())?;
+    disconnect(app, mm_pubkey, "suspended");
+    Ok(record.to_json())
+}
+
+pub fn delete(app: &App, mm_pubkey: &str) -> Result<Value, RegError> {
+    app.mms.delete(mm_pubkey)?;
+    disconnect(app, mm_pubkey, "deleted");
+    Ok(json!({ "mm_pubkey": mm_pubkey, "deleted": true }))
 }
 
 #[cfg(test)]

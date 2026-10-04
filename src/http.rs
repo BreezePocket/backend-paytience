@@ -6,19 +6,20 @@ use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
-use axum::extract::{DefaultBodyLimit, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde_json::{Value, json};
 
 use crate::admin::{self, Auth};
 use crate::market::{self, BoardQuery, MarketError, first_values};
-use crate::protocol::{error_body, rfq_decline, sign_rejection};
+use crate::mmreg::{self, RegError};
+use crate::protocol::{error_body, now_ms, num, rfq_decline, sign_rejection};
 use crate::state::App;
-use crate::{auction, sign, ws};
+use crate::{auction, exposure, sign, ws};
 
 pub const MAX_BODY_BYTES: usize = 64 * 1024;
 pub const SERVICE: &str = "paytience-backend";
@@ -35,7 +36,13 @@ pub fn build_router(app: Arc<App>) -> Router {
         .route("/rfq", post(rfq))
         .route("/sign", post(sign_tx))
         .route("/faucet", get(faucet_info).post(faucet_claim))
+        .route("/mm/apply", post(mm_apply))
+        .route("/mm/status", get(mm_status))
         .route("/admin/mms", get(admin_mms))
+        .route("/admin/mms/{pubkey}", delete(admin_delete))
+        .route("/admin/mms/{pubkey}/approve", post(admin_approve))
+        .route("/admin/mms/{pubkey}/reject", post(admin_reject))
+        .route("/admin/mms/{pubkey}/suspend", post(admin_suspend))
         .fallback(not_found)
         .method_not_allowed_fallback(not_found)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
@@ -122,6 +129,16 @@ async fn health(State(app): State<Arc<App>>) -> Response {
                 .map(|i| i.mm_pubkey.clone())
         })
         .unwrap_or_default();
+    // §5.7: totals, caps and the per-asset view are the backend's own, over the MMs
+    // merged here; `capPerExpiryUsd` and `perExpiry` stay the desks' figures.
+    let merged_mms: Vec<String> = snaps.iter().map(|(pk, _)| pk.clone()).collect();
+    let (total_usd, cap_total_usd, per_asset) = exposure::backend_view(&app, &merged_mms);
+    let mut exposure = merged.exposure;
+    if let Some(obj) = exposure.as_object_mut() {
+        obj.insert("totalUsd".into(), num(total_usd));
+        obj.insert("capTotalUsd".into(), num(cap_total_usd));
+        obj.insert("perAsset".into(), per_asset);
+    }
     json_response(
         200,
         &json!({
@@ -134,7 +151,7 @@ async fn health(State(app): State<Arc<App>>) -> Response {
             "dry_run": merged.dry_run,
             "price": merged.price,
             "assets": merged.assets,
-            "exposure": merged.exposure,
+            "exposure": exposure,
             "stats": app.stats.snapshot(),
         }),
     )
@@ -234,15 +251,129 @@ async fn faucet_claim(
     }
 }
 
-async fn admin_mms(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
-    match admin::authorize(&app, &headers) {
-        Auth::Disabled => not_found().await,
+/// §5.2 `POST /mm/apply`.
+async fn mm_apply(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>) -> Response {
+    let body = match parse_body(body) {
+        Ok(b) => b,
+        Err((status, err)) => return json_response(status, &err),
+    };
+    let now = now_ms();
+    let application = match mmreg::parse_application(&body, now) {
+        Ok(a) => a,
+        Err(why) => return json_response(400, &error_body(why)),
+    };
+    let mm_pubkey = application.mm_pubkey.clone();
+    match app.mms.apply(application, now) {
+        Ok(status) => {
+            tracing::info!(mm = %mm_pubkey, status = status.as_str(), "market-maker application received");
+            json_response(
+                200,
+                &json!({ "mm_pubkey": mm_pubkey, "status": status.as_str() }),
+            )
+        }
+        Err(e) => registry_error(&e),
+    }
+}
+
+/// §5.3 `GET /mm/status?pubkey=`.
+async fn mm_status(State(app): State<Arc<App>>, q: Query<Vec<(String, String)>>) -> Response {
+    let q = query_map(q);
+    match q.get("pubkey").and_then(|pk| app.mms.get(pk)) {
+        Some(record) => json_response(200, &record.status_json()),
+        None => json_response(404, &error_body("unknown market maker")),
+    }
+}
+
+fn registry_error(e: &RegError) -> Response {
+    let status = match e {
+        RegError::NotFound => 404,
+        RegError::Invalid(_) => 400,
+        RegError::Full => 429,
+        RegError::Storage(why) => {
+            tracing::error!("cannot save the market-maker registry: {why}");
+            return json_response(500, &error_body("cannot save the registry"));
+        }
+    };
+    json_response(status, &error_body(e.to_string()))
+}
+
+/// `Authorization: Bearer <ADMIN_TOKEN>` (§2.9): the refusal to send, if any.
+fn admin_refusal(app: &App, headers: &HeaderMap) -> Option<Response> {
+    match admin::authorize(app, headers) {
+        Auth::Allowed => None,
+        Auth::Disabled => Some(json_response(404, &error_body("not found"))),
         Auth::Denied => {
             let mut res = json_response(401, &error_body("unauthorized"));
             res.headers_mut()
                 .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
-            res
+            Some(res)
         }
-        Auth::Allowed => json_response(200, &admin::list_mms(&app)),
     }
+}
+
+async fn admin_mms(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+    match admin_refusal(&app, &headers) {
+        None => json_response(200, &admin::list_mms(&app)),
+        Some(refusal) => refusal,
+    }
+}
+
+fn admin_result(result: Result<Value, RegError>) -> Response {
+    match result {
+        Ok(body) => json_response(200, &body),
+        Err(e) => registry_error(&e),
+    }
+}
+
+/// §5.4 approve: the body is optional (`{ cap_total_usd?, asset_caps_usd? }`).
+async fn admin_approve(
+    State(app): State<Arc<App>>,
+    Path(pubkey): Path<String>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    if let Some(refusal) = admin_refusal(&app, &headers) {
+        return refusal;
+    }
+    let body = match parse_body(body) {
+        Ok(b) => b,
+        Err((status, err)) => return json_response(status, &err),
+    };
+    if !body.is_object() {
+        return json_response(400, &error_body("body must be a JSON object"));
+    }
+    admin_result(admin::approve(&app, &pubkey, &body))
+}
+
+async fn admin_reject(
+    State(app): State<Arc<App>>,
+    Path(pubkey): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(refusal) = admin_refusal(&app, &headers) {
+        return refusal;
+    }
+    admin_result(admin::reject(&app, &pubkey))
+}
+
+async fn admin_suspend(
+    State(app): State<Arc<App>>,
+    Path(pubkey): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(refusal) = admin_refusal(&app, &headers) {
+        return refusal;
+    }
+    admin_result(admin::suspend(&app, &pubkey))
+}
+
+async fn admin_delete(
+    State(app): State<Arc<App>>,
+    Path(pubkey): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(refusal) = admin_refusal(&app, &headers) {
+        return refusal;
+    }
+    admin_result(admin::delete(&app, &pubkey))
 }

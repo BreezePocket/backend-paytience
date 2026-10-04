@@ -1,4 +1,4 @@
-//! Backend configuration (contract §3). Every env var has a field here; the liveness,
+//! Backend configuration (contract §3, §5.8). Every env var has a field here; the liveness,
 //! faucet-confirmation, rate-limit and WebSocket-limit knobs at the bottom are contract
 //! constants, kept on the struct so tests can shrink them, and are not read from the
 //! environment.
@@ -9,9 +9,12 @@ use std::time::Duration;
 
 use thiserror::Error;
 
+use crate::mmreg::MmRecord;
+
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8080";
 pub const DEFAULT_SOLANA_RPC: &str = "https://api.devnet.solana.com";
 pub const DEFAULT_PROGRAM_ID: &str = "BeytdpJYSGP1oFRxEiBLkSRGuW6HW3Pk9dqSZCuSteQ9";
+pub const DEFAULT_MM_REGISTRY_PATH: &str = "./data/mm-registry.json";
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ConfigError {
@@ -28,70 +31,6 @@ fn invalid(key: &'static str, why: impl Into<String>) -> ConfigError {
     }
 }
 
-/// One allowlisted market maker: its display name and base58 pubkey.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AllowlistEntry {
-    pub name: String,
-    pub pubkey: String,
-}
-
-/// `MM_ALLOWLIST`: `name:pubkey,name:pubkey`; a bare `pubkey` is named by its first 8 chars.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Allowlist {
-    entries: Vec<AllowlistEntry>,
-}
-
-impl Allowlist {
-    pub fn parse(raw: &str) -> Result<Self, ConfigError> {
-        let mut entries: Vec<AllowlistEntry> = Vec::new();
-        for item in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-            // Pubkeys never contain ':', so the last one separates name from key.
-            let (name, pubkey) = match item.rsplit_once(':') {
-                Some((name, pubkey)) => (name.trim().to_string(), pubkey.trim().to_string()),
-                None => (String::new(), item.to_string()),
-            };
-            if !is_pubkey(&pubkey) {
-                return Err(invalid(
-                    "MM_ALLOWLIST",
-                    format!("{pubkey:?} is not a base58 pubkey"),
-                ));
-            }
-            if entries.iter().any(|e| e.pubkey == pubkey) {
-                return Err(invalid("MM_ALLOWLIST", format!("{pubkey} is listed twice")));
-            }
-            let name = if name.is_empty() {
-                pubkey.chars().take(8).collect()
-            } else {
-                name
-            };
-            entries.push(AllowlistEntry { name, pubkey });
-        }
-        if entries.is_empty() {
-            return Err(invalid("MM_ALLOWLIST", "no market makers listed"));
-        }
-        Ok(Self { entries })
-    }
-
-    pub fn from_entries(entries: Vec<AllowlistEntry>) -> Self {
-        Self { entries }
-    }
-
-    pub fn entries(&self) -> &[AllowlistEntry] {
-        &self.entries
-    }
-
-    pub fn name_of(&self, pubkey: &str) -> Option<&str> {
-        self.entries
-            .iter()
-            .find(|e| e.pubkey == pubkey)
-            .map(|e| e.name.as_str())
-    }
-
-    pub fn contains(&self, pubkey: &str) -> bool {
-        self.name_of(pubkey).is_some()
-    }
-}
-
 /// True for a base58 string that decodes to exactly 32 bytes.
 pub fn is_pubkey(s: &str) -> bool {
     matches!(bs58::decode(s).into_vec(), Ok(bytes) if bytes.len() == 32)
@@ -103,7 +42,12 @@ pub struct Config {
     pub solana_rpc: String,
     pub program_id: String,
     pub usdc_mint: String,
-    pub allowlist: Allowlist,
+    /// §5: the registration file. None keeps the registry in memory only (tests).
+    pub mm_registry_path: Option<PathBuf>,
+    /// §5.6: the RPC used for `getProgramAccounts`; None means `solana_rpc`.
+    pub solana_scan_rpc: Option<String>,
+    /// §5.6: usage scan interval.
+    pub exposure_sync: Duration,
     pub rfq_timeout: Duration,
     pub sign_timeout: Duration,
     pub market_timeout: Duration,
@@ -142,6 +86,13 @@ pub struct Config {
     pub ws_max_unauthenticated: usize,
     /// §1.2: the same, per client IP (as §2.10 identifies it).
     pub ws_max_unauthenticated_per_ip: usize,
+    /// Records added to the registry at startup when their pubkey is not in it yet.
+    /// Not read from the environment: tests start with approved market makers.
+    pub seed_mms: Vec<MmRecord>,
+    /// §5.6: scan the chain for each MM's usage. Not read from the environment; with
+    /// false (tests without a mock `getProgramAccounts`) nothing is scanned, every MM's
+    /// on-chain usage counts as known and zero, and only reservations are enforced.
+    pub exposure_scan: bool,
 }
 
 /// §2.10 requests per client IP per fixed window, by route class.
@@ -176,14 +127,16 @@ impl Default for RateLimits {
 }
 
 impl Config {
-    /// Contract defaults for everything except the two required values.
-    pub fn new(usdc_mint: impl Into<String>, allowlist: Allowlist) -> Self {
+    /// Contract defaults for everything except the one required value.
+    pub fn new(usdc_mint: impl Into<String>) -> Self {
         Self {
             bind_addr: DEFAULT_BIND_ADDR.to_string(),
             solana_rpc: DEFAULT_SOLANA_RPC.to_string(),
             program_id: DEFAULT_PROGRAM_ID.to_string(),
             usdc_mint: usdc_mint.into(),
-            allowlist,
+            mm_registry_path: Some(PathBuf::from(DEFAULT_MM_REGISTRY_PATH)),
+            solana_scan_rpc: None,
+            exposure_sync: Duration::from_millis(30_000),
             rfq_timeout: Duration::from_millis(1000),
             sign_timeout: Duration::from_millis(10_000),
             market_timeout: Duration::from_millis(2500),
@@ -208,7 +161,14 @@ impl Config {
             ws_max_message_bytes: 1 << 20,
             ws_max_unauthenticated: 256,
             ws_max_unauthenticated_per_ip: 8,
+            seed_mms: Vec::new(),
+            exposure_scan: true,
         }
+    }
+
+    /// The URL the usage scan uses: `SOLANA_SCAN_RPC`, else `SOLANA_RPC`.
+    pub fn scan_rpc_url(&self) -> &str {
+        self.solana_scan_rpc.as_deref().unwrap_or(&self.solana_rpc)
     }
 
     pub fn from_env() -> Result<Self, ConfigError> {
@@ -231,9 +191,7 @@ impl Config {
         if !is_pubkey(&usdc_mint) {
             return Err(invalid("USDC_MINT", "not a base58 pubkey"));
         }
-        let allowlist =
-            Allowlist::parse(&get("MM_ALLOWLIST").ok_or(ConfigError::Missing("MM_ALLOWLIST"))?)?;
-        let mut cfg = Self::new(usdc_mint, allowlist);
+        let mut cfg = Self::new(usdc_mint);
 
         if let Some(v) = get("BIND_ADDR") {
             cfg.bind_addr = v;
@@ -271,6 +229,11 @@ impl Config {
                 },
             }
         };
+        if let Some(v) = get("MM_REGISTRY_PATH") {
+            cfg.mm_registry_path = Some(PathBuf::from(v));
+        }
+        cfg.solana_scan_rpc = get("SOLANA_SCAN_RPC");
+        cfg.exposure_sync = ms("EXPOSURE_SYNC_MS", cfg.exposure_sync)?;
         cfg.rfq_timeout = ms("RFQ_TIMEOUT_MS", cfg.rfq_timeout)?;
         cfg.sign_timeout = ms("SIGN_TIMEOUT_MS", cfg.sign_timeout)?;
         cfg.market_timeout = ms("MARKET_TIMEOUT_MS", cfg.market_timeout)?;
@@ -316,44 +279,36 @@ mod tests {
     }
 
     #[test]
-    fn allowlist_names_and_bare_pubkeys() {
-        let list = Allowlist::parse(&format!(" alpha:{A} , {B},")).unwrap();
-        assert_eq!(list.entries().len(), 2);
-        assert_eq!(list.name_of(A), Some("alpha"));
-        assert_eq!(list.name_of(B), Some("9hSR6S7W"));
-        assert!(!list.contains(MINT));
-    }
-
-    #[test]
-    fn allowlist_rejects_bad_input() {
-        assert!(Allowlist::parse("").is_err());
-        assert!(Allowlist::parse(" , ").is_err());
-        assert!(Allowlist::parse("alpha:notakey").is_err());
-        assert!(Allowlist::parse("alpha:1111").is_err());
-        assert!(Allowlist::parse(&format!("a:{A},b:{A}")).is_err());
-    }
-
-    #[test]
-    fn requires_usdc_mint_and_allowlist() {
+    fn requires_only_the_usdc_mint() {
         assert_eq!(
-            Config::from_map(&map(&[("MM_ALLOWLIST", A)])).unwrap_err(),
+            Config::from_map(&map(&[])).unwrap_err(),
             ConfigError::Missing("USDC_MINT")
         );
-        assert_eq!(
-            Config::from_map(&map(&[("USDC_MINT", MINT)])).unwrap_err(),
-            ConfigError::Missing("MM_ALLOWLIST")
+        assert!(Config::from_map(&map(&[("USDC_MINT", "x")])).is_err());
+        // MM_ALLOWLIST is no longer read, whatever it holds.
+        assert!(
+            Config::from_map(&map(&[("USDC_MINT", MINT), ("MM_ALLOWLIST", "garbage")])).is_ok()
         );
-        assert!(Config::from_map(&map(&[("USDC_MINT", "x"), ("MM_ALLOWLIST", A)])).is_err());
+        assert!(is_pubkey(A) && is_pubkey(B) && !is_pubkey("1111"));
     }
 
     #[test]
     fn defaults_match_the_contract() {
         let cfg = Config::from_map(&map(&[
             ("USDC_MINT", MINT),
-            ("MM_ALLOWLIST", A),
             ("ADMIN_TOKEN", ""),
+            ("SOLANA_SCAN_RPC", ""),
         ]))
         .unwrap();
+        assert_eq!(
+            cfg.mm_registry_path,
+            Some(PathBuf::from("./data/mm-registry.json"))
+        );
+        assert_eq!(cfg.solana_scan_rpc, None);
+        assert_eq!(cfg.scan_rpc_url(), "https://api.devnet.solana.com");
+        assert_eq!(cfg.exposure_sync, Duration::from_millis(30_000));
+        assert!(cfg.exposure_scan);
+        assert!(cfg.seed_mms.is_empty());
         assert_eq!(cfg.bind_addr, "127.0.0.1:8080");
         assert_eq!(cfg.solana_rpc, "https://api.devnet.solana.com");
         assert_eq!(cfg.program_id, DEFAULT_PROGRAM_ID);
@@ -387,7 +342,9 @@ mod tests {
     fn overrides_parse() {
         let cfg = Config::from_map(&map(&[
             ("USDC_MINT", MINT),
-            ("MM_ALLOWLIST", &format!("alpha:{A}")),
+            ("MM_REGISTRY_PATH", "/opt/paytience/data/mm-registry.json"),
+            ("SOLANA_SCAN_RPC", "https://scan.example/KEY"),
+            ("EXPOSURE_SYNC_MS", "15000"),
             ("BIND_ADDR", "0.0.0.0:9000"),
             ("RFQ_TIMEOUT_MS", "250"),
             ("BROADCAST", "false"),
@@ -397,6 +354,12 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(cfg.bind_addr, "0.0.0.0:9000");
+        assert_eq!(
+            cfg.mm_registry_path,
+            Some(PathBuf::from("/opt/paytience/data/mm-registry.json"))
+        );
+        assert_eq!(cfg.scan_rpc_url(), "https://scan.example/KEY");
+        assert_eq!(cfg.exposure_sync, Duration::from_millis(15_000));
         assert_eq!(cfg.rfq_timeout, Duration::from_millis(250));
         assert!(!cfg.broadcast);
         assert_eq!(cfg.faucet_keypair, Some(PathBuf::from("/keys/faucet.json")));
@@ -406,10 +369,11 @@ mod tests {
 
     #[test]
     fn rejects_bad_numbers() {
-        let base = [("USDC_MINT", MINT), ("MM_ALLOWLIST", A)];
+        let base = [("USDC_MINT", MINT)];
         for (k, v) in [
             ("RFQ_TIMEOUT_MS", "abc"),
             ("SIGN_TIMEOUT_MS", "0"),
+            ("EXPOSURE_SYNC_MS", "0"),
             ("BROADCAST", "maybe"),
             ("FAUCET_ASSET_USD", "-1"),
         ] {

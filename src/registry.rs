@@ -255,6 +255,29 @@ impl Registry {
         f(&mut inner.instances.values())
     }
 
+    /// Closes every live connection of one pubkey and removes its instances (§5.4: the
+    /// MM was rejected, suspended or deleted). Returns how many sockets were closed.
+    pub fn close_pubkey(&self, mm_pubkey: &str, code: u16, reason: &str) -> usize {
+        let conns: Vec<Arc<Conn>> = {
+            let mut inner = self.lock();
+            let keys: Vec<(String, String)> = inner
+                .instances
+                .keys()
+                .filter(|(pk, _)| pk == mm_pubkey)
+                .cloned()
+                .collect();
+            keys.iter()
+                .filter_map(|key| inner.instances.remove(key))
+                .flat_map(|i| [i.rfq, i.sign])
+                .flatten()
+                .collect()
+        };
+        for c in &conns {
+            c.close(code, reason);
+        }
+        conns.len()
+    }
+
     /// Closes every connection (server shutdown).
     pub fn close_all(&self, code: u16, reason: &str) {
         let conns: Vec<Arc<Conn>> = {
@@ -412,6 +435,35 @@ mod tests {
         reg.set_health(&instance(&reg, "b", "1").rfq, json!({"dry_run": true}));
         assert_eq!(ids(prefer_live(reg.eligible(), fresh)), ["a1", "a2", "b1"]);
         assert_eq!(ids(reg.market_representatives(fresh)), ["a1", "b1"]);
+    }
+
+    #[test]
+    fn close_pubkey_closes_and_removes_every_instance() {
+        let reg = Registry::new();
+        let mut a = Vec::new();
+        for inst in ["1", "2"] {
+            for channel in [Channel::Rfq, Channel::Sign] {
+                let c = conn(&reg, "a", inst, channel);
+                reg.register(c.clone());
+                a.push(c);
+            }
+        }
+        // A half-connected instance is closed too.
+        let half = conn(&reg, "a", "3", Channel::Rfq);
+        reg.register(half.clone());
+        let b = conn(&reg, "b", "1", Channel::Rfq);
+        reg.register(b.clone());
+        reg.register(conn(&reg, "b", "1", Channel::Sign));
+
+        assert_eq!(reg.close_pubkey("a", 4003, "suspended"), 5);
+        assert!(a.iter().all(|c| c.is_closed()) && half.is_closed());
+        assert!(!b.is_closed());
+        assert_eq!(reg.eligible().len(), 1);
+        assert!(reg.sign_conns_for("a").is_empty());
+        assert_eq!(reg.close_pubkey("a", 4003, "again"), 0);
+        // The closed socket's own cleanup is a no-op.
+        reg.unregister(&a[0]);
+        assert_eq!(reg.eligible()[0].mm_pubkey, "b");
     }
 
     #[test]

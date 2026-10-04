@@ -1,15 +1,26 @@
-//! Reads just enough of a user-signed transaction to route it (contract §2.7 step 1):
-//! the fee payer (the MM) and the `nonce` of its open_position / open_asset_position
-//! instruction. The desk does every economic check; this only has to be unambiguous.
+//! Reads just enough of a user-signed transaction to route it (contract §2.7 step 1)
+//! and to reserve its notional against the MM's caps (§5.6): the fee payer (the MM)
+//! and the arguments of its open_position / open_asset_position instruction. The desk
+//! does every economic check; this only has to be unambiguous.
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use solana_transaction::Transaction;
 
+use crate::exposure::Product;
+
 pub const OPEN_POSITION_DISCRIMINATOR: [u8; 8] = [135, 128, 47, 77, 15, 152, 240, 49];
 pub const OPEN_ASSET_POSITION_DISCRIMINATOR: [u8; 8] = [120, 227, 20, 71, 252, 225, 87, 70];
-/// discriminator 8 + product 1 + fixed_price 8 + expiry_ts 8 + amount 8 + yield_amount 8.
+/// Instruction data: discriminator 8, product u8, fixed_price u64, expiry_ts i64,
+/// amount u64, yield_amount u64, nonce u64.
+const PRODUCT_OFFSET: usize = 8;
+const FIXED_PRICE_OFFSET: usize = 9;
+const EXPIRY_OFFSET: usize = 17;
+const AMOUNT_OFFSET: usize = 25;
 const NONCE_OFFSET: usize = 41;
+/// open_asset_position accounts in IDL order: market_maker, user, config, asset,
+/// asset_mint, ...
+const ASSET_MINT_ACCOUNT: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenKind {
@@ -22,6 +33,14 @@ pub struct OpenTx {
     pub fee_payer: String,
     pub nonce: u64,
     pub kind: OpenKind,
+    pub product: Product,
+    /// USDC base units per whole asset.
+    pub fixed_price: u64,
+    pub expiry_ts: i64,
+    /// The user's collateral: the asset for SellSol, USDC for BuySol.
+    pub amount: u64,
+    /// The asset's mint for open_asset_position; None for SOL.
+    pub asset_mint: Option<String>,
 }
 
 /// Parses base64 wire bytes; the error is the `<why>` of "invalid transaction: <why>".
@@ -52,16 +71,38 @@ pub fn parse_open_tx(tx_base64: &str, program_id: &str) -> Result<OpenTx, String
             Some(d) if d == OPEN_ASSET_POSITION_DISCRIMINATOR => OpenKind::Asset,
             _ => continue,
         };
-        let nonce = ix
+        let word = |offset: usize| {
+            ix.data
+                .get(offset..offset + 8)
+                .and_then(|b| <[u8; 8]>::try_from(b).ok())
+                .ok_or("open_position data is too short")
+        };
+        let nonce = u64::from_le_bytes(word(NONCE_OFFSET)?);
+        let product = ix
             .data
-            .get(NONCE_OFFSET..NONCE_OFFSET + 8)
-            .and_then(|b| <[u8; 8]>::try_from(b).ok())
-            .map(u64::from_le_bytes)
-            .ok_or("open_position data is too short")?;
+            .get(PRODUCT_OFFSET)
+            .copied()
+            .and_then(Product::from_byte)
+            .ok_or("open_position has an unknown product")?;
+        let asset_mint = match kind {
+            OpenKind::Sol => None,
+            OpenKind::Asset => Some(
+                ix.accounts
+                    .get(ASSET_MINT_ACCOUNT)
+                    .and_then(|i| keys.get(usize::from(*i)))
+                    .ok_or("open_asset_position has no asset mint account")?
+                    .to_string(),
+            ),
+        };
         return Ok(OpenTx {
             fee_payer,
             nonce,
             kind,
+            product,
+            fixed_price: u64::from_le_bytes(word(FIXED_PRICE_OFFSET)?),
+            expiry_ts: i64::from_le_bytes(word(EXPIRY_OFFSET)?),
+            amount: u64::from_le_bytes(word(AMOUNT_OFFSET)?),
+            asset_mint,
         });
     }
     Err("no open_position instruction for the program".into())
@@ -119,15 +160,46 @@ mod tests {
             let (tx, fee_payer, nonce) = case(name);
             let parsed = parse_open_tx(&tx, PROGRAM).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert_eq!(
-                parsed,
-                OpenTx {
-                    fee_payer,
-                    nonce: nonce.unwrap(),
-                    kind
-                },
+                (parsed.fee_payer, parsed.nonce, parsed.kind),
+                (fee_payer, nonce.unwrap(), kind),
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn reads_the_instruction_arguments() {
+        // gen-fixtures.mjs: sell_sol, 0.5 SOL at 250 USDC, expiry 1759824000.
+        let (tx, _, _) = case("open_position_sol");
+        let sol = parse_open_tx(&tx, PROGRAM).unwrap();
+        assert_eq!(
+            (
+                sol.product,
+                sol.fixed_price,
+                sol.expiry_ts,
+                sol.amount,
+                sol.asset_mint
+            ),
+            (
+                Product::SellSol,
+                250_000_000,
+                1_759_824_000,
+                500_000_000,
+                None
+            )
+        );
+        // buy_sol with 100 USDC on the asset minted by Keypair.fromSeed([5; 32]).
+        let (tx, _, _) = case("open_asset_position");
+        let asset = parse_open_tx(&tx, PROGRAM).unwrap();
+        assert_eq!(
+            (asset.product, asset.fixed_price, asset.amount),
+            (Product::BuySol, 250_000_000, 100_000_000)
+        );
+        let mint = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        assert_eq!(
+            asset.asset_mint,
+            Some(bs58::encode(mint.as_bytes()).into_string())
+        );
     }
 
     #[test]

@@ -8,8 +8,9 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use ed25519_dalek::{Signer, SigningKey};
 use futures_util::{SinkExt, StreamExt};
+use paytience_backend::mmreg::{Caps, MmRecord, apply_message};
 use paytience_backend::protocol::{Channel, auth_message};
-use paytience_backend::{Allowlist, AllowlistEntry, App, Config, serve};
+use paytience_backend::{App, Config, serve};
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
@@ -66,20 +67,25 @@ pub fn key_b() -> MmKey {
     mm_key(2)
 }
 
-/// Allowlist alpha = seed 1, bravo = seed 2; short timeouts; broadcast off and the
-/// RPC pointed at a port nothing listens on, so no test can reach a real cluster.
+/// A generous approved record: every asset the tests quote, 20 000 USD each.
+pub fn seed_mm(key: &MmKey, name: &str) -> MmRecord {
+    let assets = [
+        ("SOL", 20_000.0),
+        ("TSLAON", 20_000.0),
+        ("NVDAON", 20_000.0),
+        ("NOPE", 20_000.0),
+    ];
+    MmRecord::approved(key.pubkey.clone(), name, Caps::new(20_000.0, &assets))
+}
+
+/// An in-memory registry with alpha = seed 1 and bravo = seed 2 approved; no usage
+/// scan (on-chain usage counts as known and zero); short timeouts; broadcast off and
+/// the RPC pointed at a port nothing listens on, so no test can reach a real cluster.
 pub fn test_config() -> Config {
-    let allowlist = Allowlist::from_entries(vec![
-        AllowlistEntry {
-            name: "alpha".into(),
-            pubkey: key_a().pubkey,
-        },
-        AllowlistEntry {
-            name: "bravo".into(),
-            pubkey: key_b().pubkey,
-        },
-    ]);
-    let mut cfg = Config::new(usdc_mint(), allowlist);
+    let mut cfg = Config::new(usdc_mint());
+    cfg.mm_registry_path = None;
+    cfg.seed_mms = vec![seed_mm(&key_a(), "alpha"), seed_mm(&key_b(), "bravo")];
+    cfg.exposure_scan = false;
     cfg.solana_rpc = "http://127.0.0.1:1".into();
     cfg.broadcast = false;
     cfg.rfq_timeout = Duration::from_millis(500);
@@ -207,6 +213,51 @@ impl TestServer {
 pub fn rfq_body(rfq_id: &str, nonce: &str) -> Value {
     json!({ "type": "rfq_request", "rfq_id": rfq_id, "product": "sell_sol", "fixed_price": "250000000",
             "expiry_ts": 1759824000, "amount": "500000000", "user_pubkey": user_pubkey(), "nonce": nonce })
+}
+
+/// A `POST /mm/apply` body signed by `key` (§5.2).
+pub fn application(key: &MmKey, name: &str, total: f64, assets: Value) -> Value {
+    let raw = json!({
+        "mm_pubkey": key.pubkey, "name": name, "contact": "ops@example.test",
+        "cap_total_usd": total, "asset_caps_usd": assets,
+        "timestamp_ms": paytience_backend::protocol::now_ms(),
+    })
+    .to_string();
+    let sig = key.signing.sign(apply_message(&raw).as_bytes());
+    json!({ "application": raw, "signature": B64.encode(sig.to_bytes()) })
+}
+
+pub const ADMIN_TOKEN: &str = "s3cret-admin-token";
+
+impl TestServer {
+    /// An admin request with the right bearer token.
+    pub async fn admin(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&Value>,
+    ) -> (u16, Value) {
+        let mut req = self
+            .http
+            .request(method, self.url(path))
+            .header("authorization", format!("Bearer {ADMIN_TOKEN}"));
+        if let Some(body) = body {
+            req = req.json(body);
+        }
+        let r = req.send().await.unwrap();
+        let status = r.status().as_u16();
+        (status, r.json().await.unwrap())
+    }
+
+    pub async fn approve(&self, key: &MmKey, body: &Value) -> (u16, Value) {
+        let path = format!("/admin/mms/{}/approve", key.pubkey);
+        self.admin(reqwest::Method::POST, &path, Some(body)).await
+    }
+
+    /// Waits for the first successful usage scan of `key` (§5.6).
+    pub async fn wait_usage_known(&self, key: &MmKey) {
+        wait_until(|| self.app.exposure.usage(&key.pubkey).known, "usage scan").await;
+    }
 }
 
 pub async fn wait_until(mut cond: impl FnMut() -> bool, what: &str) {
@@ -624,4 +675,162 @@ pub async fn scripted_rpc(
         url: format!("http://{addr}/"),
         calls,
     }
+}
+
+// ---------------------------------------------------------------------------
+// On-chain accounts for the usage scan (§5.6), built by hand per the contract
+
+pub const POSITION_DISC: [u8; 8] = [60, 125, 250, 193, 181, 109, 238, 86];
+pub const ASSET_POSITION_DISC: [u8; 8] = [64, 144, 148, 81, 123, 31, 96, 233];
+pub const ASSET_CONFIG_DISC: [u8; 8] = [57, 112, 247, 166, 247, 64, 140, 23];
+
+fn key_bytes(pubkey: &str) -> Vec<u8> {
+    let bytes = bs58::decode(pubkey).into_vec().unwrap();
+    assert_eq!(bytes.len(), 32);
+    bytes
+}
+
+/// What the mock chain holds for the scan.
+#[derive(Clone, Default)]
+pub struct Chain {
+    /// `(mint, symbol, decimals)`.
+    pub assets: Vec<(String, String, u8)>,
+    pub positions: Vec<ChainPosition>,
+}
+
+#[derive(Clone)]
+pub struct ChainPosition {
+    pub mm: String,
+    /// None: a SOL `PositionAccount`; Some(mint): an `AssetPosition`.
+    pub mint: Option<String>,
+    /// 0 SellSol, 1 BuySol.
+    pub product: u8,
+    pub fixed_price: u64,
+    pub expiry_ts: i64,
+    pub user_collateral: u64,
+    pub nonce: u64,
+    pub settled: bool,
+}
+
+impl ChainPosition {
+    /// An unsettled SOL SellSol position of `sol` SOL at 250 USDC, expiring far ahead.
+    pub fn sol(mm: &MmKey, sol: f64, nonce: u64) -> Self {
+        Self {
+            mm: mm.pubkey.clone(),
+            mint: None,
+            product: 0,
+            fixed_price: 250_000_000,
+            expiry_ts: 4_000_000_000,
+            user_collateral: (sol * 1e9) as u64,
+            nonce,
+            settled: false,
+        }
+    }
+
+    fn bytes(&self) -> Vec<u8> {
+        let mut d = match &self.mint {
+            None => POSITION_DISC.to_vec(),
+            Some(_) => ASSET_POSITION_DISC.to_vec(),
+        };
+        d.extend_from_slice(&key_bytes(&user_pubkey()));
+        d.extend_from_slice(&key_bytes(&self.mm));
+        match &self.mint {
+            Some(mint) => {
+                d.extend_from_slice(&key_bytes(mint));
+                d.push(self.product);
+            }
+            None => {
+                d.push(self.product);
+                d.push(self.product); // token
+            }
+        }
+        d.extend_from_slice(&self.fixed_price.to_le_bytes());
+        d.extend_from_slice(&self.expiry_ts.to_le_bytes());
+        d.extend_from_slice(&self.user_collateral.to_le_bytes());
+        d.extend_from_slice(&1u64.to_le_bytes()); // mm_collateral
+        d.extend_from_slice(&2u64.to_le_bytes()); // yield_amount
+        d.extend_from_slice(&self.nonce.to_le_bytes());
+        d.push(u8::from(self.settled));
+        d.push(255); // bump
+        d
+    }
+}
+
+fn asset_config_bytes(mint: &str, symbol: &str, decimals: u8) -> Vec<u8> {
+    let mut d = ASSET_CONFIG_DISC.to_vec();
+    d.extend_from_slice(&key_bytes(mint));
+    d.extend_from_slice(&(symbol.len() as u32).to_le_bytes());
+    d.extend_from_slice(symbol.as_bytes());
+    d.push(decimals);
+    d.extend_from_slice(&(13 * 3600i64).to_le_bytes());
+    d.push(254);
+    d
+}
+
+fn account(data: Vec<u8>) -> Value {
+    json!({
+        "pubkey": "11111111111111111111111111111111",
+        "account": { "data": [B64.encode(data), "base64"], "executable": false, "lamports": 1,
+                     "owner": PROGRAM_ID, "rentEpoch": 0, "space": 0 },
+    })
+}
+
+/// Answers `getProgramAccounts` like a node would: applies the memcmp filters
+/// (discriminator at 0, `market_maker` at 40) to `chain`.
+pub fn program_accounts(chain: &Chain, params: &Value) -> RpcReply {
+    assert_eq!(params[0], PROGRAM_ID);
+    assert_eq!(params[1]["encoding"], "base64");
+    assert_eq!(params[1]["commitment"], "confirmed");
+    let filters: Vec<(usize, Vec<u8>)> = params[1]["filters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| {
+            let m = &f["memcmp"];
+            (
+                m["offset"].as_u64().unwrap() as usize,
+                bs58::decode(m["bytes"].as_str().unwrap())
+                    .into_vec()
+                    .unwrap(),
+            )
+        })
+        .collect();
+    let all = chain
+        .assets
+        .iter()
+        .map(|(mint, symbol, decimals)| asset_config_bytes(mint, symbol, *decimals))
+        .chain(chain.positions.iter().map(ChainPosition::bytes));
+    let matching: Vec<Value> = all
+        .filter(|data| {
+            filters
+                .iter()
+                .all(|(offset, bytes)| data.get(*offset..*offset + bytes.len()) == Some(bytes))
+        })
+        .map(account)
+        .collect();
+    RpcReply::Result(json!(matching))
+}
+
+/// A mock RPC whose chain can be changed while the server runs.
+pub async fn chain_rpc(chain: Chain) -> (MockRpc, Arc<Mutex<Chain>>) {
+    let chain = Arc::new(Mutex::new(chain));
+    let shared = chain.clone();
+    let rpc = scripted_rpc(move |method, params, _| match method {
+        "getProgramAccounts" => program_accounts(&shared.lock().unwrap(), params),
+        other => RpcReply::Error(format!("unexpected method {other}")),
+    })
+    .await;
+    (rpc, chain)
+}
+
+/// `test_config` with an empty registry, the admin token set and the real usage scan
+/// against `rpc_url`, every 50 ms.
+pub fn scan_config(rpc_url: &str) -> Config {
+    let mut cfg = test_config();
+    cfg.seed_mms = Vec::new();
+    cfg.admin_token = Some(ADMIN_TOKEN.into());
+    cfg.exposure_scan = true;
+    cfg.solana_scan_rpc = Some(rpc_url.to_string());
+    cfg.exposure_sync = Duration::from_millis(50);
+    cfg
 }
